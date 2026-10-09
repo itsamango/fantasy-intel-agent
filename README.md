@@ -66,7 +66,18 @@ fantasy-intel trades --season 2024
 fantasy-intel trending --hours 24
 ```
 
-#### Breaking News & Beat Reporter Wire
+#### Sidelined Starters & Next-Man-Up Beneficiaries
+Scan all 32 NFL depth charts for sidelined starters and their direct backup beneficiaries:
+```bash
+fantasy-intel injuries --positions RB,WR,TE
+```
+
+#### AI-Synthesized Breaking News & Injury Wire
+Extract injury severity, missed timelines, and promoted depth-chart beneficiaries:
+```bash
+fantasy-intel news --synthesize --limit 10
+```
+Or query raw beat reporter wire:
 ```bash
 fantasy-intel news --query "Barkley"
 ```

@@ -173,11 +173,49 @@ def render_trending(advisor: FantasyAdvisor, args):
     console.print(table)
 
 
-def render_news(args):
-    """Render live news from ESPN and beat reporters."""
+def render_news(advisor: FantasyAdvisor, args):
+    """Render live news and AI-analyzed injury/depth-chart impact."""
+    if args.synthesize or args.ai:
+        with console.status("[bold green]Synthesizing news with AI and mapping depth chart promotions..."):
+            items = advisor.get_injury_wire(
+                limit=args.limit,
+                query=args.query,
+                use_ai=True,
+            )
+
+        if not items:
+            console.print("[yellow]No relevant news found to synthesize.[/yellow]")
+            return
+
+        console.print(Panel(
+            f"Analyzed {len(items)} breaking updates with depth chart cross-referencing.",
+            title="🧠 AI NFL Injury & Depth Chart Impact Wire",
+            border_style="cyan",
+        ))
+
+        for item in items:
+            urgency = item.get("waiver_urgency", "MODERATE")
+            border_color = "red" if "CRITICAL" in urgency else ("yellow" if "HIGH" in urgency else "blue")
+
+            lines = [
+                f"[bold white]{item.get('player_name')} ({item.get('team')} {item.get('position')})[/bold white] "
+                f"— Status: [bold red]{item.get('status')}[/bold red] ({item.get('injury_details')})",
+                f"[cyan]• Expected Timeline:[/cyan] {item.get('expected_missed_time')}",
+            ]
+
+            if item.get("promoted_beneficiary"):
+                lines.append(f"[bold green]• Promoted Beneficiary (Next Man Up):[/bold green] [bold underline]{item.get('promoted_beneficiary')}[/bold underline]")
+
+            lines.append(f"[magenta]• Opportunity Shift:[/magenta] {item.get('opportunity_impact')}")
+            lines.append(f"[bold yellow]• Urgency Rating:[/bold yellow] [{border_color}]{urgency}[/{border_color}]")
+            lines.append(f"[bold green]• Actionable Advice:[/bold green] {item.get('fantasy_action')}")
+
+            console.print(Panel("\n".join(lines), title=f"🚨 {item.get('title')[:60]}", border_style=border_color))
+        return
+
+    # Standard tabular view
     with console.status("[bold green]Parsing ESPN and NFL beat reporter feeds..."):
-        collector = NewsCollector()
-        articles = collector.fetch_latest_news()
+        articles = advisor.news_collector.fetch_latest_news()
 
     if args.query:
         q = args.query.lower()
@@ -196,6 +234,60 @@ def render_news(args):
         )
 
     console.print(table)
+
+
+def render_injuries(advisor: FantasyAdvisor, args):
+    """Render all sidelined starting players alongside their next-man-up beneficiaries."""
+    with console.status("[bold green]Scanning all 32 NFL depth charts for sidelined starters..."):
+        reports = advisor.get_sidelined_starters_report()
+
+    if args.positions:
+        target_positions = [p.strip().upper() for p in args.positions.split(",")]
+        reports = [r for r in reports if r["position"] in target_positions]
+
+    if args.team:
+        t = args.team.strip().upper()
+        reports = [r for r in reports if r["team"] == t]
+
+    if not reports:
+        console.print("[yellow]No sidelined starters found matching criteria.[/yellow]")
+        return
+
+    table = Table(
+        title=f"🚑 NFL Sidelined Starters & Next-Man-Up Beneficiaries ({len(reports)} detected)",
+        box=box.ROUNDED,
+        header_style="bold red",
+    )
+    table.add_column("Team", style="blue")
+    table.add_column("Pos", style="cyan")
+    table.add_column("Sidelined Starter", style="bold white")
+    table.add_column("Status / Injury", style="red")
+    table.add_column("Promoted Beneficiary", style="bold green")
+    table.add_column("Beneficiary Pos / Depth", style="magenta")
+    table.add_column("Action / Waiver Advice", style="dim")
+
+    for r in reports[:args.limit]:
+        starter = r["injured_starter"]
+        beneficiary = r["promoted_beneficiary"]
+
+        status_str = f"{starter.get('injury_status')} ({starter.get('injury_body_part') or 'Injury'})"
+        b_name = beneficiary.get("name", "Committee / Unknown") if beneficiary else "Committee"
+        b_pos = f"{beneficiary.get('position', '')} (Depth {beneficiary.get('depth_order', '')})" if beneficiary else "N/A"
+
+        advice = f"Priority add: {b_name} steps into starting role" if beneficiary else "Monitor rotation"
+
+        table.add_row(
+            r["team"],
+            r["position"],
+            starter["name"],
+            status_str,
+            b_name,
+            b_pos,
+            advice,
+        )
+
+    console.print(table)
+
 
 
 def render_matchup(advisor: FantasyAdvisor, args):
@@ -301,9 +393,16 @@ def main():
     trending_p.add_argument("--hours", type=int, default=24, help="Lookback hours (default: 24)")
 
     # News command
-    news_p = subparsers.add_parser("news", help="Fetch breaking NFL and ESPN news")
+    news_p = subparsers.add_parser("news", help="Fetch breaking NFL and ESPN news with AI depth-chart impact analysis")
     news_p.add_argument("--query", type=str, default=None, help="Filter news by player or team name")
-    news_p.add_argument("--limit", type=int, default=15, help="Number of headlines to display")
+    news_p.add_argument("--limit", type=int, default=10, help="Number of headlines or items to display")
+    news_p.add_argument("--synthesize", "--ai", action="store_true", dest="synthesize", help="Synthesize news with AI and map depth chart promotions")
+
+    # Injuries / Next-Man-Up command
+    injuries_p = subparsers.add_parser("injuries", help="View sidelined starters and promoted next-man-up beneficiaries")
+    injuries_p.add_argument("--positions", type=str, default=None, help="Comma-separated positions: RB,WR,TE,QB")
+    injuries_p.add_argument("--team", type=str, default=None, help="Filter by NFL team abbreviation (e.g. DAL, PHI, KC)")
+    injuries_p.add_argument("--limit", type=int, default=20, help="Max entries to display")
 
     # Matchup command
     matchup_p = subparsers.add_parser("matchup", help="Inspect your current Sleeper team, opponent, and get tactical advice")
@@ -326,7 +425,9 @@ def main():
     elif args.command == "trending":
         render_trending(advisor, args)
     elif args.command == "news":
-        render_news(args)
+        render_news(advisor, args)
+    elif args.command == "injuries":
+        render_injuries(advisor, args)
     elif args.command == "matchup":
         render_matchup(advisor, args)
 

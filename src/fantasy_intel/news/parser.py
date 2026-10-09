@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
+from fantasy_intel.news.llm_analyzer import LLMNewsAnalyzer
 
 INJURY_KEYWORDS = [
     "injured", "injury", "hamstring", "concussion", "ankle", "knee", "torn acl",
@@ -18,6 +19,9 @@ OPPORTUNITY_KEYWORDS = [
 
 class NewsContextParser:
     """Extracts fantasy context from news headlines and summaries."""
+
+    def __init__(self, llm_analyzer: Optional[LLMNewsAnalyzer] = None):
+        self.llm_analyzer = llm_analyzer or LLMNewsAnalyzer()
 
     def filter_by_player(self, articles: List[Dict[str, Any]], player_name: str) -> List[Dict[str, Any]]:
         """Filters articles that explicitly mention a player's name."""
@@ -48,3 +52,10 @@ class NewsContextParser:
             "injury_signals": injuries,
             "opportunity_signals": opportunities,
         }
+
+    def analyze_with_ai(self, articles: List[Dict[str, Any]], limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        Deep analysis extracting structured injury severity, timeframe,
+        promoted depth-chart beneficiaries, and actionable fantasy advice.
+        """
+        return self.llm_analyzer.analyze_news_items(articles, limit=limit)

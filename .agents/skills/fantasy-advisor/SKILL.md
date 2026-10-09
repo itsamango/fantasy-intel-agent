@@ -2,7 +2,7 @@
 name: fantasy-advisor
 description: >-
   Expert Fantasy Football Intelligence Agent. Analyzes multi-year historical NFL data,
-  snap counts, target share trends, expected fantasy points (xFP), and live news/injury
+  snap counts, target share trends, expected fantasy points (xFP), depth charts, and live news/injury
   feeds (ESPN, Sleeper) to provide under-the-radar waiver wire sleepers and buy-low/sell-high trades.
 ---
 
@@ -11,7 +11,8 @@ description: >-
 Use this skill when the user asks for:
 - Waiver wire pickups, sleepers, or breakout candidates
 - Trade advice (buy-low / sell-high candidates)
-- Injury replacement recommendations and depth chart surges
+- Injury replacement recommendations and depth chart surges (next-man-up beneficiaries)
+- AI-synthesized breaking news and injury severity wire
 - Live trending adds and drops across fantasy football platforms (Sleeper)
 - Player opportunity analysis (snap share %, WOPR, target share trends, expected points)
 
@@ -44,17 +45,27 @@ To query the engine via the CLI, run with the virtualenv:
    /Users/lukebenfer/PycharmProjects/fantasy-intel-agent/.venv/bin/fantasy-intel trades --season 2024
    ```
 
-3. **Live Trending Adds & Drops (Sleeper)**:
+3. **Sidelined Starters & Next-Man-Up Beneficiaries**:
+   ```bash
+   /Users/lukebenfer/PycharmProjects/fantasy-intel-agent/.venv/bin/fantasy-intel injuries --positions RB,WR,TE
+   ```
+   *Options*:
+   - `--team <team>`: Specific team (e.g. `DAL`, `SF`)
+   - `--limit <num>`: Max items to display
+
+4. **AI-Synthesized News & Depth Chart Impact Wire**:
+   ```bash
+   /Users/lukebenfer/PycharmProjects/fantasy-intel-agent/.venv/bin/fantasy-intel news --synthesize --limit 10
+   ```
+   *Options*:
+   - `--query <player_or_team>`: Filter to specific player/team (e.g. `--query "McCaffrey"`)
+
+5. **Live Trending Adds & Drops (Sleeper)**:
    ```bash
    /Users/lukebenfer/PycharmProjects/fantasy-intel-agent/.venv/bin/fantasy-intel trending --hours 24
    ```
 
-4. **Live Breaking News & Injury Wire (ESPN / Beat Feeds)**:
-   ```bash
-   /Users/lukebenfer/PycharmProjects/fantasy-intel-agent/.venv/bin/fantasy-intel news --query "Barkley"
-   ```
-
-5. **Current Sleeper Team, Opponent & Situational Advice**:
+6. **Current Sleeper Team, Opponent & Situational Advice**:
    ```bash
    /Users/lukebenfer/PycharmProjects/fantasy-intel-agent/.venv/bin/fantasy-intel matchup --username <sleeper_username>
    ```
@@ -72,4 +83,4 @@ When synthesizing advice for the user:
 - **Identify Regression**: 
   - If a player has high targets/touches but zero touchdowns, highlight them as an immediate **Buy-Low**.
   - If a player scored 2 TDs on only 4 touches and 20% snap share, highlight them as a prime **Sell-High**.
-- **Contextualize with News**: Cross-reference trending adds with breaking injuries (e.g., if a lead back is ruled out on ESPN, immediately identify the direct backup benefiting from vacant touches).
+- **Contextualize with Depth Charts**: Cross-reference breaking injuries with team depth charts. When a starter is ruled Out/IR, identify the exact next-man-up backup who inherits high-leverage touches and prioritize them for immediate waiver acquisition.

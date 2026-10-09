@@ -8,11 +8,10 @@ from fantasy_intel.data.loader import DataLoader
 from fantasy_intel.data.sleeper import SleeperClient
 from fantasy_intel.analytics.waiver_wire import WaiverWireEngine
 from fantasy_intel.analytics.trades import TradeAnalyzer
+from fantasy_intel.analytics.depth_chart import DepthChartManager
+from fantasy_intel.analytics.matchups import MatchupAdvisor
 from fantasy_intel.news.scraper import NewsCollector
 from fantasy_intel.news.parser import NewsContextParser
-
-
-from fantasy_intel.analytics.matchups import MatchupAdvisor
 
 
 class FantasyAdvisor:
@@ -21,7 +20,8 @@ class FantasyAdvisor:
     def __init__(self, data_loader: Optional[DataLoader] = None, sleeper_client: Optional[SleeperClient] = None):
         self.loader = data_loader or DataLoader()
         self.sleeper = sleeper_client or SleeperClient()
-        self.news_collector = NewsCollector()
+        self.depth_manager = DepthChartManager(sleeper_client=self.sleeper)
+        self.news_collector = NewsCollector(sleeper_client=self.sleeper)
         self.news_parser = NewsContextParser()
         self.matchup_advisor = MatchupAdvisor()
 
@@ -97,8 +97,45 @@ class FantasyAdvisor:
         drops = self.sleeper.get_trending_drops(lookback_hours=lookback_hours, limit=10)
         return {"trending_adds": adds, "trending_drops": drops}
 
+    def get_injury_wire(
+        self,
+        limit: int = 12,
+        positions: Optional[List[str]] = None,
+        query: Optional[str] = None,
+        use_ai: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """
+        Synthesizes real-time injury reports from RSS feeds and Sleeper notes,
+        evaluates severity with LLM/AI, and identifies promoted next-man-up beneficiaries.
+        """
+        # Fetch RSS articles
+        rss_articles = self.news_collector.fetch_latest_news(limit_per_feed=10)
+        # Fetch Sleeper beat notes
+        sleeper_notes = self.news_collector.fetch_sleeper_injury_notes(positions=positions)
+
+        combined_items = rss_articles + sleeper_notes
+
+        if query:
+            q = query.lower()
+            combined_items = [
+                item for item in combined_items
+                if q in item.get("title", "").lower() or q in item.get("summary", "").lower()
+            ]
+
+        if use_ai:
+            return self.news_parser.analyze_with_ai(combined_items, limit=limit)
+
+        return [self.news_parser.analyze_article(a) for a in combined_items[:limit]]
+
+    def get_sidelined_starters_report(self) -> List[Dict[str, Any]]:
+        """
+        Returns all starter-tier players (depth_order == 1 or top WR) currently sidelined,
+        paired with their promoted backup beneficiary.
+        """
+        return self.depth_manager.get_all_sidelined_starters()
+
     def get_player_intel(self, player_name: str, season: int = 2024) -> Dict[str, Any]:
-        """Deep dive dossier on a specific player: stats trajectory + relevant news."""
+        """Deep dive dossier on a specific player: stats trajectory, depth chart, and relevant news."""
         self._ensure_engines([season])
         df = self._waiver_engine.df
 
@@ -107,10 +144,20 @@ class FantasyAdvisor:
         news = self.news_collector.fetch_latest_news(limit_per_feed=25)
         player_news = self.news_parser.filter_by_player(news, player_name)
 
+        # Depth chart & Next man up
+        depth_info = self.depth_manager.find_player(player_name)
+        beneficiary = self.depth_manager.get_next_man_up(player_name) if depth_info else None
+
+        # AI-analyzed news
+        ai_analyzed_news = self.news_parser.analyze_with_ai(player_news, limit=5) if player_news else []
+
         return {
             "player_name": player_name,
+            "depth_chart": depth_info,
+            "next_man_up": beneficiary,
             "weekly_stats": matches.sort_values(by="week", ascending=False).to_dict(orient="records"),
             "news_updates": player_news,
+            "ai_analyzed_news": ai_analyzed_news,
         }
 
     def get_situational_matchup_advice(
