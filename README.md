@@ -46,8 +46,24 @@ pip install -e .
 
 ### 2. CLI Usage
 
+#### Connect Your Sleeper Account (Zero API Key Needed!)
+Link your Sleeper username once so all commands automatically sync with your team and leagues:
+```bash
+fantasy-intel connect --username <YOUR_SLEEPER_USERNAME>
+```
+
+#### View Your Leagues & Standings
+```bash
+fantasy-intel leagues
+```
+
+#### View Your Active Team Roster & Injury Status
+```bash
+fantasy-intel roster
+```
+
 #### Discover Waiver Wire Sleepers
-Find high-opportunity players flying under the radar:
+Find high-opportunity players flying under the radar (automatically filters out players owned in your league):
 ```bash
 fantasy-intel waivers --season 2024 --limit 10
 ```

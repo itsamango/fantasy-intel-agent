@@ -262,3 +262,97 @@ class SleeperClient:
             } if opp_matchup else None,
         }
 
+    def get_user_leagues_summary(self, username_or_id: str, season: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Fetch summary of all leagues the user participates in with records and points."""
+        user_info = self.get_user(username_or_id)
+        user_id = user_info.get("user_id") if user_info else username_or_id
+
+        leagues = self.get_user_leagues(user_id, season=season)
+        summaries = []
+
+        for lg in leagues:
+            lid = lg.get("league_id")
+            rosters = self.get_league_rosters(lid)
+            my_roster = next((r for r in rosters if str(r.get("owner_id")) == str(user_id)), None)
+
+            record_str = "N/A"
+            points_for = 0.0
+            roster_id = None
+
+            if my_roster:
+                roster_id = my_roster.get("roster_id")
+                settings = my_roster.get("settings", {})
+                wins = settings.get("wins", 0)
+                losses = settings.get("losses", 0)
+                ties = settings.get("ties", 0)
+                record_str = f"{wins}-{losses}" + (f"-{ties}" if ties else "")
+                fpts = settings.get("fpts", 0)
+                fpts_dec = settings.get("fpts_decimal", 0)
+                points_for = round(fpts + (fpts_dec / 100.0), 1)
+
+            summaries.append({
+                "league_id": lid,
+                "name": lg.get("name", f"League {lid}"),
+                "total_teams": lg.get("total_rosters", 12),
+                "status": lg.get("status", "in_season"),
+                "season": lg.get("season"),
+                "record": record_str,
+                "points_for": points_for,
+                "roster_id": roster_id,
+            })
+
+        return summaries
+
+    def get_user_roster_details(self, league_id: str, username_or_id: str) -> Dict[str, Any]:
+        """Fetch detailed breakdown of user's team, starters, bench, and player stats."""
+        user_info = self.get_user(username_or_id)
+        user_id = user_info.get("user_id") if user_info else username_or_id
+
+        rosters = self.get_league_rosters(league_id)
+        my_roster = next((r for r in rosters if str(r.get("owner_id")) == str(user_id)), None)
+        if not my_roster:
+            return {"error": f"User {username_or_id} not found in league {league_id}."}
+
+        league_info = self.get_league_info(league_id)
+        all_players = self.get_all_players()
+
+        def enrich(pid: str) -> Dict[str, Any]:
+            p = all_players.get(str(pid), {})
+            return {
+                "player_id": str(pid),
+                "name": p.get("full_name") or f"{p.get('first_name', '')} {p.get('last_name', '')}".strip() or f"Player {pid}",
+                "position": p.get("position", "N/A"),
+                "team": p.get("team", "FA"),
+                "depth_order": p.get("depth_chart_order"),
+                "injury_status": p.get("injury_status"),
+                "injury_body_part": p.get("injury_body_part"),
+                "injury_notes": p.get("injury_notes"),
+            }
+
+        starters = [enrich(pid) for pid in my_roster.get("starters", []) if pid]
+        starter_ids = {p["player_id"] for p in starters}
+        all_p = [enrich(pid) for pid in my_roster.get("players", []) if pid]
+        bench = [p for p in all_p if p["player_id"] not in starter_ids]
+        reserve = [enrich(pid) for pid in my_roster.get("reserve", []) if pid]
+        taxi = [enrich(pid) for pid in my_roster.get("taxi", []) if pid]
+
+        settings = my_roster.get("settings", {})
+        wins = settings.get("wins", 0)
+        losses = settings.get("losses", 0)
+        ties = settings.get("ties", 0)
+
+        return {
+            "league_id": league_id,
+            "league_name": league_info.get("name", f"League {league_id}"),
+            "season": league_info.get("season"),
+            "record": f"{wins}-{losses}" + (f"-{ties}" if ties else ""),
+            "points_for": round(settings.get("fpts", 0) + (settings.get("fpts_decimal", 0) / 100.0), 1),
+            "points_against": round(settings.get("fpts_against", 0) + (settings.get("fpts_against_decimal", 0) / 100.0), 1),
+            "waiver_position": settings.get("waiver_position", "N/A"),
+            "starters": starters,
+            "bench": bench,
+            "reserve": reserve,
+            "taxi": taxi,
+        }
+
+

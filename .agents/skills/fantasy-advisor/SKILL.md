@@ -31,7 +31,22 @@ To query the engine via the CLI, run with the virtualenv:
 
 ### Available CLI Commands:
 
-1. **Under-the-radar Waiver Sleepers**:
+1. **Connect Sleeper Account**:
+   ```bash
+   /Users/lukebenfer/PycharmProjects/fantasy-intel-agent/.venv/bin/fantasy-intel connect --username <sleeper_username>
+   ```
+
+2. **View Your Leagues & Standings**:
+   ```bash
+   /Users/lukebenfer/PycharmProjects/fantasy-intel-agent/.venv/bin/fantasy-intel leagues
+   ```
+
+3. **View Your Active Team Roster & Starters**:
+   ```bash
+   /Users/lukebenfer/PycharmProjects/fantasy-intel-agent/.venv/bin/fantasy-intel roster
+   ```
+
+4. **Under-the-radar Waiver Sleepers**:
    ```bash
    /Users/lukebenfer/PycharmProjects/fantasy-intel-agent/.venv/bin/fantasy-intel waivers --season 2024 --limit 10
    ```

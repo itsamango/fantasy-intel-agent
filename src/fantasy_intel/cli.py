@@ -9,7 +9,7 @@ from rich.panel import Panel
 from rich import box
 
 from fantasy_intel.agent.advisor import FantasyAdvisor
-from fantasy_intel.config import DEFAULT_SEASON
+from fantasy_intel.config import DEFAULT_SEASON, load_user_config, save_user_config
 from fantasy_intel.news.scraper import NewsCollector
 
 console = Console()
@@ -17,13 +17,15 @@ console = Console()
 
 def render_waivers(advisor: FantasyAdvisor, args):
     """Render waiver sleepers table."""
+    config = load_user_config()
+    league_id = args.league_id or config.get("default_league_id")
     with console.status("[bold green]Analyzing snap trajectories and opportunity metrics..."):
         positions = [p.strip().upper() for p in args.positions.split(",")] if args.positions else None
         sleepers = advisor.get_waiver_sleepers(
             season=args.season,
             week=args.week,
             positions=positions,
-            league_id=args.league_id,
+            league_id=league_id,
             limit=args.limit,
         )
 
@@ -290,12 +292,196 @@ def render_injuries(advisor: FantasyAdvisor, args):
 
 
 
+def render_connect(advisor: FantasyAdvisor, args):
+    """Connect Sleeper account and save username/league to local config."""
+    username = args.username.strip()
+    with console.status(f"[bold green]Validating Sleeper username '{username}'..."):
+        user_info = advisor.sleeper.get_user(username)
+
+    if not user_info:
+        console.print(f"[bold red]Error:[/bold red] Sleeper username '{username}' was not found. Please double check the spelling.")
+        return
+
+    user_id = user_info.get("user_id")
+    display_name = user_info.get("display_name", username)
+
+    # Fetch user's leagues for the current/selected season
+    with console.status("[bold green]Fetching your Sleeper leagues..."):
+        leagues = advisor.sleeper.get_user_leagues_summary(user_id, season=args.season)
+
+    default_lid = args.league_id
+    if not default_lid and leagues:
+        default_lid = leagues[0]["league_id"]
+
+    saved = save_user_config({
+        "sleeper_username": display_name,
+        "default_league_id": default_lid,
+        "season": args.season,
+    })
+
+    console.print(Panel(
+        f"✅ [bold green]Successfully connected to Sleeper![/bold green]\n\n"
+        f"• User: [bold white]{display_name}[/bold white] (ID: {user_id})\n"
+        f"• Default League: [cyan]{default_lid or 'None'}[/cyan]\n"
+        f"• Season: [cyan]{args.season}[/cyan]\n"
+        f"• Saved to: [dim]~/.fantasy_intel/config.json[/dim]",
+        title="🔗 Sleeper Integration Connected",
+        border_style="green",
+    ))
+
+    if leagues:
+        table = Table(title=f"📋 Your Active Sleeper Leagues ({len(leagues)})", box=box.ROUNDED)
+        table.add_column("League Name", style="bold white")
+        table.add_column("League ID", style="cyan")
+        table.add_column("Teams", justify="center")
+        table.add_column("Record", justify="center", style="bold green")
+        table.add_column("Points For", justify="right", style="magenta")
+        table.add_column("Default", justify="center")
+
+        for lg in leagues:
+            is_def = "⭐ Active" if str(lg["league_id"]) == str(default_lid) else ""
+            table.add_row(
+                lg["name"],
+                str(lg["league_id"]),
+                str(lg["total_teams"]),
+                lg["record"],
+                str(lg["points_for"]),
+                is_def,
+            )
+        console.print(table)
+
+
+def render_leagues(advisor: FantasyAdvisor, args):
+    """List all leagues for the connected or specified Sleeper user."""
+    config = load_user_config()
+    username = args.username or config.get("sleeper_username")
+    if not username:
+        console.print("[bold red]No Sleeper username provided or saved.[/bold red]")
+        console.print("Run [bold cyan]fantasy-intel connect --username <your_username>[/bold cyan] first.")
+        return
+
+    with console.status(f"[bold green]Fetching leagues for '{username}'..."):
+        leagues = advisor.get_user_leagues_overview(username, season=args.season)
+
+    if not leagues:
+        console.print(f"[yellow]No leagues found for '{username}' in season {args.season}.[/yellow]")
+        return
+
+    default_lid = config.get("default_league_id")
+    table = Table(title=f"🏆 Sleeper Leagues for '{username}' ({args.season})", box=box.ROUNDED)
+    table.add_column("League Name", style="bold white")
+    table.add_column("League ID", style="cyan")
+    table.add_column("Teams", justify="center")
+    table.add_column("Record", justify="center", style="bold green")
+    table.add_column("Points For", justify="right", style="magenta")
+    table.add_column("Default", justify="center")
+
+    for lg in leagues:
+        is_def = "⭐ Active" if str(lg["league_id"]) == str(default_lid) else ""
+        table.add_row(
+            lg["name"],
+            str(lg["league_id"]),
+            str(lg["total_teams"]),
+            lg["record"],
+            str(lg["points_for"]),
+            is_def,
+        )
+
+    console.print(table)
+
+
+def render_roster(advisor: FantasyAdvisor, args):
+    """Inspect detailed roster breakdown, starters, bench, and player injury status."""
+    config = load_user_config()
+    username = args.username or config.get("sleeper_username")
+    league_id = args.league_id or config.get("default_league_id")
+
+    if not username:
+        console.print("[bold red]No Sleeper username provided or saved.[/bold red]")
+        console.print("Run [bold cyan]fantasy-intel connect --username <your_username>[/bold cyan] first.")
+        return
+
+    if not league_id:
+        # Try fetching user leagues to pick the first one
+        leagues = advisor.get_user_leagues_overview(username, season=args.season)
+        if leagues:
+            league_id = leagues[0]["league_id"]
+        else:
+            console.print("[bold red]No Sleeper league ID found.[/bold red]")
+            return
+
+    with console.status(f"[bold green]Fetching roster for '{username}' in league {league_id}..."):
+        roster = advisor.get_roster_overview(league_id, username)
+
+    if "error" in roster:
+        console.print(f"[bold red]Error:[/bold red] {roster['error']}")
+        return
+
+    console.print(Panel(
+        f"[bold white]{roster['league_name']}[/bold white] — Team Record: [bold green]{roster['record']}[/bold green] "
+        f"| PF: [bold magenta]{roster['points_for']}[/bold magenta] | PA: [bold red]{roster['points_against']}[/bold red] "
+        f"| Waiver Priority: #{roster['waiver_position']}",
+        title=f"🏈 {username}'s Roster Dashboard",
+        border_style="cyan",
+    ))
+
+    # Starters Table
+    s_table = Table(title="⭐ Starting Lineup", box=box.ROUNDED, header_style="bold green")
+    s_table.add_column("Player", style="bold white")
+    s_table.add_column("Pos", style="cyan")
+    s_table.add_column("Team", style="blue")
+    s_table.add_column("Depth", justify="center")
+    s_table.add_column("Status / Injury", style="red")
+
+    for p in roster.get("starters", []):
+        status = f"[bold red]{p.get('injury_status')}[/bold red] ({p.get('injury_body_part') or 'Injury'})" if p.get("injury_status") else "[green]Active[/green]"
+        s_table.add_row(
+            p.get("name", ""),
+            p.get("position", ""),
+            p.get("team", ""),
+            str(p.get("depth_order") or "-"),
+            status,
+        )
+    console.print(s_table)
+
+    # Bench Table
+    b_table = Table(title="🪑 Bench & Reserves", box=box.ROUNDED, header_style="bold yellow")
+    b_table.add_column("Player", style="bold white")
+    b_table.add_column("Pos", style="cyan")
+    b_table.add_column("Team", style="blue")
+    b_table.add_column("Role / Slot", justify="center")
+    b_table.add_column("Status / Injury", style="red")
+
+    for p in roster.get("bench", []):
+        status = f"[bold red]{p.get('injury_status')}[/bold red]" if p.get("injury_status") else "[green]Active[/green]"
+        b_table.add_row(p.get("name", ""), p.get("position", ""), p.get("team", ""), "Bench", status)
+
+    for p in roster.get("reserve", []):
+        status = f"[bold red]{p.get('injury_status') or 'IR'}[/bold red]"
+        b_table.add_row(p.get("name", ""), p.get("position", ""), p.get("team", ""), "[red]IR[/red]", status)
+
+    for p in roster.get("taxi", []):
+        status = f"[yellow]{p.get('injury_status')}[/yellow]" if p.get("injury_status") else "[green]Active[/green]"
+        b_table.add_row(p.get("name", ""), p.get("position", ""), p.get("team", ""), "[magenta]Taxi[/magenta]", status)
+
+    console.print(b_table)
+
+
 def render_matchup(advisor: FantasyAdvisor, args):
     """Render head-to-head matchup, starting lineups, injury alerts, and tactical advice."""
-    with console.status(f"[bold green]Fetching Sleeper matchup for '{args.username}'..."):
+    config = load_user_config()
+    username = args.username or config.get("sleeper_username")
+    league_id = args.league_id or config.get("default_league_id")
+
+    if not username:
+        console.print("[bold red]No Sleeper username provided or saved.[/bold red]")
+        console.print("Run [bold cyan]fantasy-intel connect --username <your_username>[/bold cyan] or provide --username.")
+        return
+
+    with console.status(f"[bold green]Fetching Sleeper matchup for '{username}'..."):
         result = advisor.get_situational_matchup_advice(
-            username_or_id=args.username,
-            league_id=args.league_id,
+            username_or_id=username,
+            league_id=league_id,
             week=args.week,
         )
 
@@ -404,9 +590,26 @@ def main():
     injuries_p.add_argument("--team", type=str, default=None, help="Filter by NFL team abbreviation (e.g. DAL, PHI, KC)")
     injuries_p.add_argument("--limit", type=int, default=20, help="Max entries to display")
 
+    # Connect / Config command
+    connect_p = subparsers.add_parser("connect", aliases=["config"], help="Connect your Sleeper account and save defaults")
+    connect_p.add_argument("--username", type=str, required=True, help="Your Sleeper username")
+    connect_p.add_argument("--league-id", type=str, default=None, help="Default Sleeper league ID")
+    connect_p.add_argument("--season", type=int, default=DEFAULT_SEASON, help="NFL Season (default: 2024)")
+
+    # Leagues command
+    leagues_p = subparsers.add_parser("leagues", help="List all your Sleeper leagues, records, and points")
+    leagues_p.add_argument("--username", type=str, default=None, help="Optional Sleeper username (defaults to saved)")
+    leagues_p.add_argument("--season", type=int, default=DEFAULT_SEASON, help="NFL Season (default: 2024)")
+
+    # Roster command
+    roster_p = subparsers.add_parser("roster", help="View your full roster, starters vs bench, and player injury status")
+    roster_p.add_argument("--username", type=str, default=None, help="Optional Sleeper username (defaults to saved)")
+    roster_p.add_argument("--league-id", type=str, default=None, help="Optional Sleeper league ID (defaults to active)")
+    roster_p.add_argument("--season", type=int, default=DEFAULT_SEASON, help="NFL Season (default: 2024)")
+
     # Matchup command
     matchup_p = subparsers.add_parser("matchup", help="Inspect your current Sleeper team, opponent, and get tactical advice")
-    matchup_p.add_argument("--username", type=str, required=True, help="Your Sleeper username or user_id")
+    matchup_p.add_argument("--username", type=str, default=None, help="Your Sleeper username or user_id (defaults to saved)")
     matchup_p.add_argument("--league-id", type=str, default=None, help="Optional Sleeper league ID")
     matchup_p.add_argument("--week", type=int, default=None, help="Optional NFL Week number")
 
@@ -418,7 +621,13 @@ def main():
 
     advisor = FantasyAdvisor()
 
-    if args.command == "waivers":
+    if args.command in ["connect", "config"]:
+        render_connect(advisor, args)
+    elif args.command == "leagues":
+        render_leagues(advisor, args)
+    elif args.command == "roster":
+        render_roster(advisor, args)
+    elif args.command == "waivers":
         render_waivers(advisor, args)
     elif args.command == "trades":
         render_trades(advisor, args)

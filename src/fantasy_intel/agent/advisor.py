@@ -192,3 +192,12 @@ class FantasyAdvisor:
             "matchup_overview": overview,
             "tactical_advice": eval_result,
         }
+
+    def get_user_leagues_overview(self, username_or_id: str, season: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Fetch summary of user's active leagues and performance."""
+        return self.sleeper.get_user_leagues_summary(username_or_id, season=season)
+
+    def get_roster_overview(self, league_id: str, username_or_id: str) -> Dict[str, Any]:
+        """Fetch full details on the user's active roster in a league."""
+        return self.sleeper.get_user_roster_details(league_id, username_or_id)
+
