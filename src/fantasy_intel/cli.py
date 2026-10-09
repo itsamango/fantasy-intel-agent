@@ -198,6 +198,87 @@ def render_news(args):
     console.print(table)
 
 
+def render_matchup(advisor: FantasyAdvisor, args):
+    """Render head-to-head matchup, starting lineups, injury alerts, and tactical advice."""
+    with console.status(f"[bold green]Fetching Sleeper matchup for '{args.username}'..."):
+        result = advisor.get_situational_matchup_advice(
+            username_or_id=args.username,
+            league_id=args.league_id,
+            week=args.week,
+        )
+
+    if "error" in result:
+        console.print(f"[bold red]Error:[/bold red] {result['error']}")
+        return
+
+    overview = result["matchup_overview"]
+    advice = result["tactical_advice"]
+    my_team = overview["my_team"]
+    opp_team = overview.get("opponent_team")
+
+    console.print(Panel(
+        f"[bold white]{my_team['user_name']}[/bold white] vs [bold white]{opp_team['user_name'] if opp_team else 'BYE'}[/bold white] "
+        f"— [cyan]NFL Week {overview['week']}[/cyan] (League ID: {overview['league_id']})",
+        title="⚔️ Head-to-Head Sleeper Matchup",
+        border_style="cyan",
+    ))
+
+    # Starters Table
+    table = Table(title="📋 Starting Lineups Comparison", box=box.ROUNDED)
+    table.add_column("My Starters", style="bold white")
+    table.add_column("Pos", style="cyan")
+    table.add_column("Status", style="red")
+    table.add_column("Opponent Starters", style="bold white")
+    table.add_column("Pos", style="magenta")
+    table.add_column("Status", style="red")
+
+    my_starters = my_team.get("starters", [])
+    opp_starters = opp_team.get("starters", []) if opp_team else []
+    max_len = max(len(my_starters), len(opp_starters))
+
+    for i in range(max_len):
+        my_p = my_starters[i] if i < len(my_starters) else {}
+        opp_p = opp_starters[i] if i < len(opp_starters) else {}
+
+        my_status = f"[bold red]{my_p.get('injury_status')}[/bold red]" if my_p.get("injury_status") in ["Out", "IR"] else (
+            f"[yellow]{my_p.get('injury_status')}[/yellow]" if my_p.get("injury_status") else "[green]Active[/green]"
+        )
+        opp_status = f"[bold red]{opp_p.get('injury_status')}[/bold red]" if opp_p.get("injury_status") in ["Out", "IR"] else (
+            f"[yellow]{opp_p.get('injury_status')}[/yellow]" if opp_p.get("injury_status") else "[green]Active[/green]"
+        )
+
+        table.add_row(
+            f"{my_p.get('name', '')} ({my_p.get('team', '')})",
+            str(my_p.get("position", "")),
+            my_status,
+            f"{opp_p.get('name', '')} ({opp_p.get('team', '')})",
+            str(opp_p.get("position", "")),
+            opp_status,
+        )
+
+    console.print(table)
+
+    # Injury & Lineup Alerts
+    alerts = advice.get("injury_alerts", [])
+    if alerts:
+        alert_lines = []
+        for a in alerts:
+            color = "red" if a["severity"] == "CRITICAL" else "yellow"
+            alert_lines.append(f"[{color}]• [{a['severity']}] {a['action']}[/{color}]")
+        console.print(Panel("\n".join(alert_lines), title="🚨 Starting Lineup Alerts", border_style="red"))
+
+    # Tactical Substitutions & Strategy
+    suggestions = advice.get("start_sit_suggestions", [])
+    notes = advice.get("strategy_notes", [])
+    if suggestions or notes:
+        rec_lines = []
+        for s in suggestions:
+            rec_lines.append(f"[bold green]• SWAP SUGGESTION:[/bold green] Bench [red]{s['sit']}[/red] ➔ Start [green]{s['start']}[/green] ({s['reason']})")
+        for n in notes:
+            rec_lines.append(f"[cyan]• TACTICAL NOTE:[/cyan] {n}")
+        console.print(Panel("\n".join(rec_lines), title="💡 Agent Recommendations & Strategy", border_style="green"))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Fantasy Football Intelligence Agent CLI")
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
@@ -224,6 +305,12 @@ def main():
     news_p.add_argument("--query", type=str, default=None, help="Filter news by player or team name")
     news_p.add_argument("--limit", type=int, default=15, help="Number of headlines to display")
 
+    # Matchup command
+    matchup_p = subparsers.add_parser("matchup", help="Inspect your current Sleeper team, opponent, and get tactical advice")
+    matchup_p.add_argument("--username", type=str, required=True, help="Your Sleeper username or user_id")
+    matchup_p.add_argument("--league-id", type=str, default=None, help="Optional Sleeper league ID")
+    matchup_p.add_argument("--week", type=int, default=None, help="Optional NFL Week number")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -240,6 +327,8 @@ def main():
         render_trending(advisor, args)
     elif args.command == "news":
         render_news(args)
+    elif args.command == "matchup":
+        render_matchup(advisor, args)
 
 
 if __name__ == "__main__":

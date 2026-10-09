@@ -12,6 +12,9 @@ from fantasy_intel.news.scraper import NewsCollector
 from fantasy_intel.news.parser import NewsContextParser
 
 
+from fantasy_intel.analytics.matchups import MatchupAdvisor
+
+
 class FantasyAdvisor:
     """The central agent brain for fantasy recommendations."""
 
@@ -20,6 +23,7 @@ class FantasyAdvisor:
         self.sleeper = sleeper_client or SleeperClient()
         self.news_collector = NewsCollector()
         self.news_parser = NewsContextParser()
+        self.matchup_advisor = MatchupAdvisor()
 
         # Cached analytics engines
         self._waiver_engine: Optional[WaiverWireEngine] = None
@@ -107,4 +111,37 @@ class FantasyAdvisor:
             "player_name": player_name,
             "weekly_stats": matches.sort_values(by="week", ascending=False).to_dict(orient="records"),
             "news_updates": player_news,
+        }
+
+    def get_situational_matchup_advice(
+        self,
+        username_or_id: str,
+        league_id: Optional[str] = None,
+        week: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Fetches the user's active matchup and delivers tailored tactical advice:
+        - Injury alerts for active starters
+        - Recommended bench/starter swaps
+        - Opponent strengths/vulnerabilities
+        """
+        # Resolve username to user_id
+        user_info = self.sleeper.get_user(username_or_id)
+        user_id = user_info.get("user_id") if user_info else username_or_id
+
+        # If league_id not provided, find user's leagues
+        if not league_id:
+            leagues = self.sleeper.get_user_leagues(user_id)
+            if not leagues:
+                return {"error": f"No active leagues found for user '{username_or_id}'."}
+            league_id = leagues[0].get("league_id")
+
+        overview = self.sleeper.get_user_matchup_overview(league_id=league_id, user_id=user_id, week=week)
+        if "error" in overview:
+            return overview
+
+        eval_result = self.matchup_advisor.evaluate_lineup(overview)
+        return {
+            "matchup_overview": overview,
+            "tactical_advice": eval_result,
         }

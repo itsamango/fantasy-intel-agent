@@ -18,9 +18,10 @@
    - Ingests real-time RSS feeds from ESPN, ProFootballTalk, and beat reporters.
    - Automatically tags news with injury severity and role expansion alerts.
 
-4. **Sleeper API League & Trend Integration**:
+4. **Sleeper API League & Matchup Integration**:
    - Live query of nationwide trending adds and drops across all fantasy leagues.
    - Filter waiver recommendations specifically against your private Sleeper league's rostered players.
+   - **Situational Matchup Inspector**: Inspect your starting lineup vs your opponent, detect active injuries, and receive tactical start/sit swap suggestions.
 
 5. **Antigravity Custom Skill**:
    - Includes `.agents/skills/fantasy-advisor/SKILL.md` so the agent can pair program and provide fantasy advice natively inside Antigravity!
@@ -69,6 +70,13 @@ fantasy-intel trending --hours 24
 ```bash
 fantasy-intel news --query "Barkley"
 ```
+
+#### Situational Matchup & Starting Lineup Advice
+Connect directly to your Sleeper account:
+```bash
+fantasy-intel matchup --username <YOUR_SLEEPER_USERNAME>
+```
+*Evaluates your starters against your opponent, alerts you to injured starters, and suggests optimal bench substitutions.*
 
 ---
 
