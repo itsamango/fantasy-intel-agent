@@ -35,7 +35,9 @@ class TradeAnalyzer:
         if week is not None:
             filtered = filtered[filtered["week"] == week]
         else:
-            filtered = filtered[filtered["week"] == filtered["week"].max()]
+            reg = filtered[filtered["season_type"] == "REG"] if "season_type" in filtered.columns else filtered[filtered["week"] <= 18]
+            latest_week = reg["week"].max() if not reg.empty else filtered["week"].max()
+            filtered = filtered[filtered["week"] == latest_week]
 
         if positions:
             filtered = filtered[filtered["position"].isin(positions)]
@@ -87,7 +89,9 @@ class TradeAnalyzer:
         if week is not None:
             filtered = filtered[filtered["week"] == week]
         else:
-            filtered = filtered[filtered["week"] == filtered["week"].max()]
+            reg = filtered[filtered["season_type"] == "REG"] if "season_type" in filtered.columns else filtered[filtered["week"] <= 18]
+            latest_week = reg["week"].max() if not reg.empty else filtered["week"].max()
+            filtered = filtered[filtered["week"] == latest_week]
 
         if positions:
             filtered = filtered[filtered["position"].isin(positions)]

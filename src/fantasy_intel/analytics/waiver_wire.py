@@ -40,8 +40,9 @@ class WaiverWireEngine:
         if week is not None:
             filtered = filtered[filtered["week"] == week]
         else:
-            # Default to latest week
-            latest_week = filtered["week"].max()
+            # Default to latest regular season week
+            reg = filtered[filtered["season_type"] == "REG"] if "season_type" in filtered.columns else filtered[filtered["week"] <= 18]
+            latest_week = reg["week"].max() if not reg.empty else filtered["week"].max()
             filtered = filtered[filtered["week"] == latest_week]
 
         if positions:

@@ -329,12 +329,12 @@ class SleeperClient:
                 "injury_notes": p.get("injury_notes"),
             }
 
-        starters = [enrich(pid) for pid in my_roster.get("starters", []) if pid]
+        starters = [enrich(pid) for pid in (my_roster.get("starters") or []) if pid]
         starter_ids = {p["player_id"] for p in starters}
-        all_p = [enrich(pid) for pid in my_roster.get("players", []) if pid]
+        all_p = [enrich(pid) for pid in (my_roster.get("players") or []) if pid]
         bench = [p for p in all_p if p["player_id"] not in starter_ids]
-        reserve = [enrich(pid) for pid in my_roster.get("reserve", []) if pid]
-        taxi = [enrich(pid) for pid in my_roster.get("taxi", []) if pid]
+        reserve = [enrich(pid) for pid in (my_roster.get("reserve") or []) if pid]
+        taxi = [enrich(pid) for pid in (my_roster.get("taxi") or []) if pid]
 
         settings = my_roster.get("settings", {})
         wins = settings.get("wins", 0)
