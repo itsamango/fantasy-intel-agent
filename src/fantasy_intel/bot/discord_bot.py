@@ -141,13 +141,16 @@ def create_bot(advisor: Optional[FantasyAdvisor] = None) -> commands.Bot:
 
         try:
             pos_list = [p.strip().upper() for p in positions.split(",")] if positions else None
+            stats_season = season if season <= 2024 else 2024
             sleepers = advisor.get_waiver_sleepers(
-                season=season,
+                season=stats_season,
                 positions=pos_list,
                 league_id=lid,
                 limit=limit,
             )
-            embed = create_waivers_embed(sleepers)
+            league_info = advisor.sleeper.get_league_info(lid)
+            lname = league_info.get("name") if league_info else "your league"
+            embed = create_waivers_embed(sleepers, league_name=lname)
             await interaction.followup.send(embed=embed)
         except Exception as e:
             await interaction.followup.send(f"❌ Error scanning waivers: {e}")

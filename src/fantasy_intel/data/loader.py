@@ -41,8 +41,17 @@ class DataLoader:
             if cache_file.exists() and not force_refresh:
                 df = pd.read_parquet(cache_file)
             else:
-                df = nfl.import_weekly_data([season])
-                df.to_parquet(cache_file, index=False)
+                try:
+                    df = nfl.import_weekly_data([season])
+                    df.to_parquet(cache_file, index=False)
+                except Exception as e:
+                    logger.warning(f"Failed to fetch NFL weekly data for {season}: {e}. Falling back to season {DEFAULT_SEASON}.")
+                    fallback_cache = self.cache_dir / f"weekly_{DEFAULT_SEASON}.parquet"
+                    if fallback_cache.exists():
+                        df = pd.read_parquet(fallback_cache)
+                    else:
+                        df = nfl.import_weekly_data([DEFAULT_SEASON])
+                        df.to_parquet(fallback_cache, index=False)
             dfs.append(df)
 
         combined = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
@@ -59,8 +68,17 @@ class DataLoader:
             if cache_file.exists() and not force_refresh:
                 df = pd.read_parquet(cache_file)
             else:
-                df = nfl.import_snap_counts([season])
-                df.to_parquet(cache_file, index=False)
+                try:
+                    df = nfl.import_snap_counts([season])
+                    df.to_parquet(cache_file, index=False)
+                except Exception as e:
+                    logger.warning(f"Failed to fetch NFL snap counts for {season}: {e}. Falling back to season {DEFAULT_SEASON}.")
+                    fallback_cache = self.cache_dir / f"snaps_{DEFAULT_SEASON}.parquet"
+                    if fallback_cache.exists():
+                        df = pd.read_parquet(fallback_cache)
+                    else:
+                        df = nfl.import_snap_counts([DEFAULT_SEASON])
+                        df.to_parquet(fallback_cache, index=False)
             dfs.append(df)
 
         combined = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
