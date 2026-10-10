@@ -167,17 +167,23 @@ class DataLoader:
                 continue
 
             gp = float(st.get("gp") or 1.0)
+            if gp <= 0:
+                continue
             pts = float(st.get("pts_ppr", 0.0) or 0.0)
             targets = float(st.get("rec_tgt", 0.0) or 0.0)
             carries = float(st.get("rush_att", 0.0) or 0.0)
             rec_yd = float(st.get("rec_yd", 0.0) or 0.0)
             rush_yd = float(st.get("rush_yd", 0.0) or 0.0)
             snaps = float(st.get("off_snp", 0.0) or 0.0)
+            air_yd = float(st.get("rec_air_yd", 0.0) or 0.0)
 
-            snap_pct = min(1.0, round(snaps / (gp * 65.0), 2)) if gp > 0 else 0.0
-            tgt_share = min(0.40, round(targets / (gp * 32.0), 2)) if gp > 0 else 0.0
+            snap_pct = min(1.0, round(snaps / (gp * 65.0), 2))
+            tgt_share = min(0.40, round(targets / (gp * 32.0), 2))
             wopr = round(1.5 * tgt_share + 0.7 * (rec_yd / (gp * 220.0)), 2)
-            xfp = round(targets * 1.3 + carries * 0.68 + (rec_yd + rush_yd) * 0.08, 1)
+            per_game_pts = round(pts / gp, 1)
+            per_game_tgt = round(targets / gp, 1)
+            per_game_car = round(carries / gp, 1)
+            per_game_xfp = round(per_game_tgt * 1.3 + per_game_car * 0.68 + ((rec_yd + rush_yd) / gp) * 0.08, 1)
 
             rows.append({
                 "player_id": str(pid),
@@ -188,18 +194,19 @@ class DataLoader:
                 "week": 5,
                 "season_type": "REG",
                 "games_played": int(gp),
-                "fantasy_points_ppr": pts,
-                "recent_ppr": round(pts / gp, 1),
-                "targets": targets,
-                "carries": carries,
-                "touches": targets + carries,
-                "offense_snaps": snaps,
+                "fantasy_points_ppr": per_game_pts,
+                "recent_ppr": per_game_pts,
+                "targets": per_game_tgt,
+                "carries": per_game_car,
+                "touches": per_game_tgt + per_game_car,
+                "offense_snaps": round(snaps / gp, 1),
                 "offense_pct": snap_pct,
                 "snap_delta": 0.05,
                 "target_share": tgt_share,
+                "receiving_air_yards": round(air_yd / gp, 1),
                 "wopr": wopr,
-                "expected_fp_ppr": xfp,
-                "fp_diff": round(pts - xfp, 1),
+                "expected_fp_ppr": per_game_xfp,
+                "fp_diff": round(per_game_pts - per_game_xfp, 1),
             })
 
         return pd.DataFrame(rows)
