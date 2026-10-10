@@ -44,3 +44,7 @@ data_cache/
 # IDEs
 .idea/
 .vscode/
+
+# Secrets
+.env
+
