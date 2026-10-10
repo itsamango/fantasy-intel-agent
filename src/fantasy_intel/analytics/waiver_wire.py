@@ -91,6 +91,32 @@ class WaiverWireEngine:
 
         filtered["catalyst"] = filtered.apply(make_catalyst, axis=1)
 
+        # Enrich with live depth chart and injury context
+        from fantasy_intel.analytics.depth_chart import DepthChartManager
+        dcm = DepthChartManager()
+
+        elevation_tiers = []
+        ir_eligibles = []
+        depth_roles = []
+        situations = []
+        inj_statuses = []
+
+        for name in filtered["player_display_name"]:
+            ctx = dcm.get_player_elevation_context(name)
+            elevation_tiers.append(ctx.get("tier", "UNKNOWN"))
+            ir_eligibles.append(ctx.get("ir_eligible", False))
+            depth_roles.append(ctx.get("healthy_role", ""))
+            situations.append(ctx.get("summary", ""))
+            own_inj = ctx.get("own_injury")
+            own_part = ctx.get("own_body_part")
+            inj_statuses.append(f"{own_inj} ({own_part})" if own_inj and own_part else (own_inj or "Healthy"))
+
+        filtered["elevation_tier"] = elevation_tiers
+        filtered["ir_eligible"] = ir_eligibles
+        filtered["depth_role"] = depth_roles
+        filtered["situation"] = situations
+        filtered["injury_status"] = inj_statuses
+
         result_cols = [
             "player_display_name",
             "position",
@@ -105,6 +131,10 @@ class WaiverWireEngine:
             "expected_fp_ppr",
             "opportunity_index",
             "catalyst",
+            "injury_status",
+            "ir_eligible",
+            "depth_role",
+            "situation",
         ]
 
         available_cols = [c for c in result_cols if c in filtered.columns]

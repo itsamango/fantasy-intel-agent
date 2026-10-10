@@ -71,3 +71,26 @@ def test_waiver_engine_filtering():
     assert not sleepers.empty
     assert sleepers.iloc[0]["player_display_name"] == "Rising Sleeper"
     assert sleepers.iloc[0]["opportunity_index"] > 30.0
+
+
+def test_depth_chart_elevation():
+    from fantasy_intel.analytics.depth_chart import DepthChartManager
+
+    class DummySleeper:
+        def get_all_players(self):
+            return {
+                "1": {"player_id": "1", "full_name": "Star RB", "team": "PHI", "position": "RB", "depth_chart_order": 1, "injury_status": "Out", "injury_body_part": "Hamstring"},
+                "2": {"player_id": "2", "full_name": "Backup RB", "team": "PHI", "position": "RB", "depth_chart_order": 2, "injury_status": None},
+                "3": {"player_id": "3", "full_name": "Injured Stash WR", "team": "NYJ", "position": "WR", "depth_chart_order": 3, "injury_status": "Out", "injury_body_part": "Finger"},
+            }
+
+    dcm = DepthChartManager(sleeper_client=DummySleeper())
+    # Backup RB with Star RB Out should be elevated
+    ctx = dcm.get_player_elevation_context("Backup RB")
+    assert ctx["is_elevated"] is True
+    assert ctx["tier"] == "ELEVATED_STARTER"
+
+    # Injured WR should be marked IR eligible
+    ctx_wr = dcm.get_player_elevation_context("Injured Stash WR")
+    assert ctx_wr["ir_eligible"] is True
+    assert ctx_wr["own_injury"] == "Out"

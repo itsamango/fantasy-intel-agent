@@ -70,16 +70,105 @@ class DepthChartManager:
             combined.extend(pos_players)
         return sorted(combined, key=lambda x: (x["position"], x["depth_order"]))
 
-    def find_player(self, player_name: str) -> Optional[Dict[str, Any]]:
-        """Find player metadata by full name or normalized name."""
+    def find_player(self, player_identifier: str) -> Optional[Dict[str, Any]]:
+        """Find player metadata by ID, full name, or normalized name."""
         self._ensure_depth_chart()
-        norm_target = clean_name(player_name)
+        norm_target = clean_name(player_identifier)
         for team_data in self._depth_by_team.values():
             for pos_players in team_data.values():
                 for p in pos_players:
+                    if p["player_id"] == str(player_identifier):
+                        return p
                     if p["norm_name"] == norm_target or norm_target in p["norm_name"]:
                         return p
         return None
+
+    def get_player_elevation_context(self, player_identifier: str) -> Dict[str, Any]:
+        """
+        Calculates the situational elevation of a player based on upstream teammate injuries.
+        Identifies whether a player is an entrenched starter, an elevated starter (due to injuries),
+        a potential surge beneficiary, or a standard backup.
+        """
+        self._ensure_depth_chart()
+        player = self.find_player(player_identifier)
+        if not player:
+            return {
+                "player_name": player_identifier,
+                "tier": "UNKNOWN",
+                "is_elevated": False,
+                "ir_eligible": False,
+                "summary": "Player not found on depth chart",
+                "sidelined_ahead": [],
+            }
+
+        pos = player["position"]
+        team = player["team"]
+        depth_order = player["depth_order"]
+        own_injury = player.get("injury_status")
+        own_part = player.get("injury_body_part")
+        ir_eligible = own_injury in ["Out", "IR", "PUP", "Sus"]
+
+        pos_list = self._depth_by_team.get(team, {}).get(pos, [])
+        ahead = [p for p in pos_list if p["depth_order"] < depth_order]
+        out_ahead = [p for p in ahead if p.get("injury_status") in ["Out", "IR", "PUP", "Doubtful"]]
+        q_ahead = [p for p in ahead if p.get("injury_status") == "Questionable"]
+
+        # Also find any key position peers who are currently Out or on IR
+        sidelined_peers = [
+            p for p in pos_list
+            if p["player_id"] != player["player_id"]
+            and p.get("injury_status") in ["Out", "IR", "PUP", "Doubtful"]
+        ]
+
+        healthy_role = f"{team} {pos}{depth_order if depth_order <= 4 else 'Depth'}"
+        is_temporary = False
+
+        if depth_order == 1 or (pos == "WR" and depth_order <= 2):
+            if sidelined_peers:
+                tier = "ELEVATED_STARTER"
+                is_elevated = True
+                is_temporary = True
+                peer_desc = ", ".join([f"{p['name']} ({p.get('injury_status')} - {p.get('injury_body_part') or 'Injured'})" for p in sidelined_peers])
+                summary = f"ELEVATED STARTER: Starting {pos}1 for {team} while {peer_desc} are sidelined"
+            else:
+                tier = "ENTRENCHED_STARTER"
+                is_elevated = False
+                summary = f"Starting {pos}{depth_order} for {team}"
+        elif ahead and len(out_ahead) == len(ahead):
+            tier = "ELEVATED_STARTER"
+            is_elevated = True
+            is_temporary = True
+            desc = ", ".join([f"{p['name']} ({p.get('injury_status')} - {p.get('injury_body_part') or 'Injured'})" for p in out_ahead])
+            summary = f"ELEVATED STARTER: {pos}1 workload while {desc}"
+        elif out_ahead or q_ahead:
+            tier = "POTENTIAL_SURGE"
+            is_elevated = True
+            all_inj = out_ahead + q_ahead
+            desc = ", ".join([f"{p['name']} ({p.get('injury_status')} - {p.get('injury_body_part') or 'Injured'})" for p in all_inj])
+            summary = f"POTENTIAL SURGE: Target/touch boost if injured teammates sit ({desc})"
+        else:
+            tier = "BENCH_BACKUP"
+            is_elevated = False
+            starter_names = ", ".join([p["name"] for p in ahead])
+            summary = f"Backup behind healthy starter(s): {starter_names}"
+
+        return {
+            "player_id": player["player_id"],
+            "player_name": player["name"],
+            "team": team,
+            "position": pos,
+            "depth_order": depth_order,
+            "tier": tier,
+            "is_elevated": is_elevated,
+            "is_temporary_starter": is_temporary,
+            "ir_eligible": ir_eligible,
+            "own_injury": own_injury,
+            "own_body_part": own_part,
+            "healthy_role": healthy_role,
+            "sidelined_ahead": out_ahead + q_ahead or sidelined_peers,
+            "summary": summary,
+        }
+
 
     def get_next_man_up(self, player_name: str) -> Optional[Dict[str, Any]]:
         """

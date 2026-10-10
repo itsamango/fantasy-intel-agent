@@ -209,3 +209,143 @@ class FantasyAdvisor:
         """Fetch full details on the user's active roster in a league."""
         return self.sleeper.get_user_roster_details(league_id, username_or_id)
 
+    def get_drop_recommendations(
+        self,
+        league_id: str,
+        username_or_id: Optional[str] = None,
+        week: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Evaluates the user's roster to determine safe drop candidates and critical holds.
+        Accounts for:
+        - NFL Bye weeks (prevents cutting benched studs)
+        - Upstream depth chart injuries (prevents cutting elevated starters like Will Shipley)
+        - Contingency upside (holds players with questionable teammates ahead like Dohnte Meyers)
+        - Open IR slots (prompts stashing rather than cutting)
+        """
+        from fantasy_intel.config import load_user_config
+
+        if not username_or_id:
+            cfg = load_user_config()
+            username_or_id = cfg.get("sleeper_username")
+
+        if not username_or_id:
+            return {"error": "No Sleeper username provided or configured."}
+
+        user_info = self.sleeper.get_user(username_or_id)
+        user_id = user_info.get("user_id") if user_info else username_or_id
+
+        state = self.sleeper.get_nfl_state()
+        season = int(state.get("season", 2026))
+        active_week = week or int(state.get("week", 1))
+
+        rosters = self.sleeper.get_league_rosters(league_id)
+        user_roster = next((r for r in rosters if r.get("owner_id") == user_id), None)
+        if not user_roster:
+            return {"error": f"Could not find roster for user '{username_or_id}' in league {league_id}."}
+
+        players_db = self.sleeper.get_all_players()
+        stats = self.sleeper.get_season_stats(season=season)
+        bye_teams = self.sleeper.get_bye_teams(season=season, week=active_week)
+        league_info = self.sleeper.get_league_info(league_id)
+
+        reserve_slots = int(league_info.get("settings", {}).get("reserve_slots", 0))
+        reserve = set(user_roster.get("reserve") or [])
+        starters = set(user_roster.get("starters") or [])
+        all_pids = user_roster.get("players") or []
+        open_ir = max(0, reserve_slots - len(reserve))
+
+        evaluated_players = []
+        alerts = []
+
+        for pid in all_pids:
+            p = players_db.get(str(pid), {})
+            st = stats.get(str(pid), {})
+            name = p.get("full_name") or f"Player {pid}"
+            pos = p.get("position", "??")
+            team = p.get("team", "FA")
+            is_starter = pid in starters
+            is_on_ir = pid in reserve
+            on_bye = team in bye_teams
+
+            if pos in ["K", "DEF"]:
+                elevation = {
+                    "tier": "SPECIAL_TEAMS",
+                    "is_elevated": False,
+                    "ir_eligible": False,
+                    "summary": f"{team} {pos}",
+                }
+            else:
+                elevation = self.depth_manager.get_player_elevation_context(pid)
+
+            tier = elevation.get("tier")
+            is_elevated = elevation.get("is_elevated", False)
+            ir_eligible = elevation.get("ir_eligible", False)
+            gp = float(st.get("gp") or 0)
+            pts = float(st.get("pts_ppr") or 0)
+            ppg = round(pts / gp, 1) if gp > 0 else 0.0
+
+            cut_score = 50 if not is_starter else 15
+            tag = ""
+            recommendation = "HOLD"
+
+            if ir_eligible and not is_on_ir:
+                cut_score = 10
+                tag = f"IR ELIGIBLE: Ruled {p.get('injury_status')} ({p.get('injury_body_part') or 'Injured'}). Move directly to open IR slot instead of cutting!"
+                recommendation = "MOVE_TO_IR"
+                alerts.append(f"🚑 **{name}** can be moved to an open IR slot without dropping anyone.")
+            elif on_bye and (ppg >= 14.0 or (pos == "QB" and ppg >= 16.0)):
+                cut_score = 0
+                tag = "PROTECTED: Franchise starter on Bye Week - DO NOT DROP."
+                recommendation = "HOLD (BYE)"
+                alerts.append(f"🛡️ **{name}** is on Bye Week (Week {active_week}) — benched for schedule, not skill.")
+            elif tier == "ELEVATED_STARTER" or (is_elevated and is_starter):
+                cut_score = 5
+                tag = f"CRITICAL HOLD: Elevated starter this week ({elevation.get('summary')})"
+                recommendation = "START/HOLD"
+                alerts.append(f"⚡ **{name}** is elevated to starter this week ({elevation.get('summary')}).")
+            elif tier == "POTENTIAL_SURGE":
+                cut_score = 30
+                tag = f"CONTINGENCY HOLD: Starters ahead are Questionable ({elevation.get('summary')})"
+                recommendation = "HOLD_CONTINGENCY"
+            elif tier == "ENTRENCHED_STARTER":
+                cut_score = 5
+                tag = f"Core starter for {team}"
+                recommendation = "HOLD"
+            elif tier == "BENCH_BACKUP":
+                if pos == "QB":
+                    cut_score += 25
+                if ppg < 6.5:
+                    cut_score += 20
+                tag = f"Cuttable backup ({elevation.get('summary')})"
+                recommendation = "DROP_CANDIDATE"
+
+            evaluated_players.append({
+                "player_id": str(pid),
+                "player_name": name,
+                "position": pos,
+                "team": team,
+                "ppg": ppg,
+                "is_starter": is_starter,
+                "is_on_ir": is_on_ir,
+                "on_bye": on_bye,
+                "recommendation": recommendation,
+                "cut_safety_score": cut_score,
+                "situation": elevation.get("summary", ""),
+                "tag": tag,
+            })
+
+        evaluated_players.sort(key=lambda x: x["cut_safety_score"], reverse=True)
+
+        return {
+            "league_name": league_info.get("name", "Sleeper League"),
+            "week": active_week,
+            "season": season,
+            "bye_teams": sorted(list(bye_teams)),
+            "open_ir_slots": open_ir,
+            "total_ir_slots": reserve_slots,
+            "alerts": alerts,
+            "roster_evaluations": evaluated_players,
+        }
+
+

@@ -163,13 +163,74 @@ def create_waivers_embed(sleepers: pd.DataFrame, league_name: Optional[str] = No
         fp_exp = row.get("expected_fp_ppr", 0.0)
 
         field_title = f"{pname} ({team} {pos}) • Opp Index: {opp_idx}"
+        inj = row.get("injury_status", "Healthy")
+        role = row.get("depth_role", "")
+        ir_badge = " 🚨 **[Eligible for IR Stash]**" if row.get("ir_eligible") else ""
+
         field_val = (
+            f"**Health & Role**: {inj} [{role}]{ir_badge}\n"
             f"**Snaps**: {snaps} ({delta_str}) | **Actual / xFP**: {fp_act:.1f} / {fp_exp:.1f}\n"
             f"*{catalyst}*"
         )
         embed.add_field(name=field_title, value=field_val, inline=False)
 
     embed.set_footer(text="Fantasy Intel Agent • /waivers")
+    return embed
+
+
+def create_drops_embed(drop_results: Dict[str, Any]) -> discord.Embed:
+    """Formats roster drop candidates and situational protections into a Discord Embed."""
+    league_name = drop_results.get("league_name", "League")
+    week = drop_results.get("week", 1)
+    open_ir = drop_results.get("open_ir_slots", 0)
+    bye_teams = ", ".join(drop_results.get("bye_teams", [])) or "None"
+
+    embed = discord.Embed(
+        title=f"🛡️ Roster Cut Safety & Drop Advice — Week {week}",
+        description=(
+            f"League: **{league_name}**\n"
+            f"• **Open IR Slots**: {open_ir}\n"
+            f"• **Teams on Bye**: {bye_teams}"
+        ),
+        color=discord.Color.red(),
+    )
+
+    alerts = drop_results.get("alerts", [])
+    if alerts:
+        embed.add_field(
+            name="🚨 Situational & Injury Alerts",
+            value="\n".join([f"• {a}" for a in alerts[:6]]),
+            inline=False,
+        )
+
+    evals = drop_results.get("roster_evaluations", [])
+    cut_candidates = [p for p in evals if p["cut_safety_score"] >= 25]
+    holds = [p for p in evals if p["cut_safety_score"] < 25]
+
+    if cut_candidates:
+        cut_lines = []
+        for p in cut_candidates[:5]:
+            badge = "🔴 **DROP CANDIDATE**" if p["cut_safety_score"] >= 35 else "🟡 **CONTINGENCY HOLD**"
+            status = "STARTER" if p["is_starter"] else ("BYE" if p["on_bye"] else "BENCH")
+            cut_lines.append(
+                f"{badge}: **{p['player_name']}** ({p['team']} {p['position']}) — {p['ppg']:.1f} PPG [{status}]\n"
+                f"↳ *{p['tag'] or p['situation']}*"
+            )
+        embed.add_field(name="✂️ Top Cut Candidates / Contingencies", value="\n\n".join(cut_lines), inline=False)
+
+    if holds:
+        hold_lines = []
+        for p in holds[:6]:
+            if "CRITICAL" in p.get("tag", "") or "ELEVATED" in p.get("tag", ""):
+                icon = "⚡"
+            elif p.get("on_bye"):
+                icon = "🛡️"
+            else:
+                icon = "🔒"
+            hold_lines.append(f"{icon} **{p['player_name']}** ({p['team']} {p['position']}): {p['tag']}")
+        embed.add_field(name="🔒 Critical Protected Holds", value="\n".join(hold_lines[:5]), inline=False)
+
+    embed.set_footer(text="Fantasy Intel Agent • /drops")
     return embed
 
 

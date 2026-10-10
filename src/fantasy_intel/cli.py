@@ -47,6 +47,7 @@ def render_waivers(advisor: FantasyAdvisor, args):
     table.add_column("WOPR / Trg", justify="right")
     table.add_column("Actual / xFP", justify="right")
     table.add_column("Opp Index", justify="right", style="bold green")
+    table.add_column("Health / Role", style="yellow")
     table.add_column("Catalyst & Context", style="dim")
 
     for _, row in sleepers.iterrows():
@@ -55,6 +56,11 @@ def render_waivers(advisor: FantasyAdvisor, args):
         snap_delta = f"+{int(delta_val * 100)}%" if delta_val > 0 else f"{int(delta_val * 100)}%"
         wopr_val = f"{row.get('wopr', 0):.2f}" if row.get("wopr", 0) > 0 else f"{int(row.get('targets', 0))} trg"
         fp_str = f"{row.get('fantasy_points_ppr', 0):.1f} / {row.get('expected_fp_ppr', 0):.1f}"
+
+        inj = row.get("injury_status", "Healthy")
+        role = row.get("depth_role", "")
+        ir_tag = " [bold magenta](IR Stash)[/bold magenta]" if row.get("ir_eligible") else ""
+        health_role = f"{inj} [{role}]{ir_tag}"
 
         table.add_row(
             str(row.get("player_display_name")),
@@ -65,6 +71,7 @@ def render_waivers(advisor: FantasyAdvisor, args):
             wopr_val,
             fp_str,
             str(row.get("opportunity_index")),
+            health_role,
             str(row.get("catalyst")),
         )
 
@@ -557,6 +564,85 @@ def render_matchup(advisor: FantasyAdvisor, args):
         console.print(Panel("\n".join(rec_lines), title="💡 Agent Recommendations & Strategy", border_style="green"))
 
 
+def render_drops(advisor: FantasyAdvisor, args):
+    """Render comprehensive drop candidates and roster safety evaluations."""
+    config = load_user_config()
+    league_id = args.league_id or config.get("default_league_id")
+    username = args.username or config.get("sleeper_username")
+
+    if not league_id:
+        console.print("[red]No league ID provided. Run `fantasy-intel connect` or pass `--league-id`.[/red]")
+        return
+
+    with console.status("[bold green]Analyzing roster, depth charts, upstream injuries, and bye weeks..."):
+        res = advisor.get_drop_recommendations(league_id=league_id, username_or_id=username, week=args.week)
+
+    if "error" in res:
+        console.print(f"[red]{res['error']}[/red]")
+        return
+
+    league_name = res.get("league_name", "League")
+    week = res.get("week", 1)
+    open_ir = res.get("open_ir_slots", 0)
+    alerts = res.get("alerts", [])
+    evals = res.get("roster_evaluations", [])
+
+    console.print(Panel(
+        f"[bold white]{league_name}[/bold white] — Week {week} Roster Audit\n"
+        f"[cyan]Open IR Slots:[/cyan] [bold green]{open_ir}[/bold green] | "
+        f"[cyan]Teams on Bye:[/cyan] {', '.join(res.get('bye_teams', [])) or 'None'}",
+        title="🛡️ Drop Decision & Roster Protection Engine",
+        border_style="cyan",
+    ))
+
+    if alerts:
+        alert_lines = [f"• {a}" for a in alerts]
+        console.print(Panel("\n".join(alert_lines), title="🚨 Situational & Injury Alerts", border_style="yellow"))
+
+    table = Table(
+        title="📋 Roster Cut Safety & Priority Rankings",
+        box=box.ROUNDED,
+        header_style="bold magenta",
+    )
+    table.add_column("Rec", style="bold")
+    table.add_column("Cut Score", justify="right")
+    table.add_column("Player", style="bold white")
+    table.add_column("Pos", style="cyan")
+    table.add_column("Team", style="blue")
+    table.add_column("PPG", justify="right")
+    table.add_column("Status", justify="center")
+    table.add_column("Role & Tactical Analysis", style="dim")
+
+    for p in evals:
+        score = p["cut_safety_score"]
+        rec = p["recommendation"]
+        if score >= 35:
+            rec_style = "[bold red]DROP CANDIDATE[/bold red]"
+        elif score >= 25:
+            rec_style = "[bold yellow]CONTINGENCY[/bold yellow]"
+        elif rec == "MOVE_TO_IR":
+            rec_style = "[bold magenta]MOVE TO IR[/bold magenta]"
+        elif rec == "HOLD (BYE)":
+            rec_style = "[bold blue]HOLD (BYE)[/bold blue]"
+        else:
+            rec_style = "[bold green]HOLD/START[/bold green]"
+
+        status_badge = "STARTER" if p["is_starter"] else ("IR" if p["is_on_ir"] else ("BYE" if p["on_bye"] else "BENCH"))
+
+        table.add_row(
+            rec_style,
+            str(score),
+            p["player_name"],
+            p["position"],
+            p["team"],
+            f"{p['ppg']:.1f}",
+            status_badge,
+            p["tag"] or p["situation"],
+        )
+
+    console.print(table)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Fantasy Football Intelligence Agent CLI")
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
@@ -613,6 +699,12 @@ def main():
     matchup_p.add_argument("--league-id", type=str, default=None, help="Optional Sleeper league ID")
     matchup_p.add_argument("--week", type=int, default=None, help="Optional NFL Week number")
 
+    # Drops / Roster safety command
+    drops_p = subparsers.add_parser("drops", help="Audit your roster to identify cut candidates and critical holds")
+    drops_p.add_argument("--username", type=str, default=None, help="Optional Sleeper username (defaults to saved)")
+    drops_p.add_argument("--league-id", type=str, default=None, help="Optional Sleeper league ID")
+    drops_p.add_argument("--week", type=int, default=None, help="Optional NFL Week number")
+
     # Bot command
     bot_p = subparsers.add_parser("bot", help="Run the Discord bot for mobile fantasy intelligence")
     bot_p.add_argument("--token", type=str, default=None, help="Discord Bot Token (or set DISCORD_BOT_TOKEN)")
@@ -636,6 +728,8 @@ def main():
         render_leagues(advisor, args)
     elif args.command == "roster":
         render_roster(advisor, args)
+    elif args.command == "drops":
+        render_drops(advisor, args)
     elif args.command == "waivers":
         render_waivers(advisor, args)
     elif args.command == "trades":

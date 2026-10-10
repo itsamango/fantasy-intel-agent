@@ -18,6 +18,7 @@ from fantasy_intel.bot.embeds import (
     create_roster_embed,
     create_matchup_embed,
     create_waivers_embed,
+    create_drops_embed,
     create_injuries_embed,
     create_leagues_embed,
     create_ai_advice_embed,
@@ -154,7 +155,25 @@ def create_bot(advisor: Optional[FantasyAdvisor] = None) -> commands.Bot:
         except Exception as e:
             await interaction.followup.send(f"❌ Error scanning waivers: {e}")
 
-    # 4. /injuries command
+    # 4. /drops command
+    @bot.tree.command(name="drops", description="Audit your roster to identify safe cut candidates, bye weeks, and holds")
+    @app_commands.describe(league_id="Optional Sleeper league ID", week="Optional NFL Week number")
+    async def slash_drops(interaction: discord.Interaction, league_id: Optional[str] = None, week: Optional[int] = None):
+        await interaction.response.defer()
+        username, lid, _ = get_effective_context(league_id)
+
+        try:
+            res = advisor.get_drop_recommendations(league_id=lid, username_or_id=username, week=week)
+            if "error" in res:
+                await interaction.followup.send(f"❌ {res['error']}")
+                return
+
+            embed = create_drops_embed(res)
+            await interaction.followup.send(embed=embed)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error analyzing drop candidates: {e}")
+
+    # 5. /injuries command
     @bot.tree.command(name="injuries", description="View sidelined NFL starters and promoted next-man-up beneficiaries")
     @app_commands.describe(positions="Filter positions (e.g. RB,WR,TE)", limit="Max items (default: 8)")
     async def slash_injuries(interaction: discord.Interaction, positions: Optional[str] = None, limit: int = 8):

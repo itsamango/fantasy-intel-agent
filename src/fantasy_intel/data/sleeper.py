@@ -86,6 +86,54 @@ class SleeperClient:
             logger.error(f"Failed to download sleeper season stats for {season}: {e}")
             return {}
 
+    def get_week_projections(
+        self, season: int = 2026, week: int = 1, force_refresh: bool = False
+    ) -> Dict[str, Dict[str, Any]]:
+        """Fetches and caches weekly player projections from Sleeper."""
+        cache_path = self.cache_dir / f"sleeper_projections_{season}_{week}.json"
+        if cache_path.exists() and not force_refresh:
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to read cached projections for {season} W{week}: {e}")
+
+        url = f"{SLEEPER_BASE_URL}/projections/nfl/regular/{season}/{week}"
+        try:
+            resp = requests.get(url, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            return data
+        except Exception as e:
+            logger.error(f"Failed to fetch sleeper projections for {season} W{week}: {e}")
+            return {}
+
+    def get_bye_teams(self, season: int = 2026, week: int = 1) -> Set[str]:
+        """Identifies NFL teams on bye for the given week based on zero player projections."""
+        projections = self.get_week_projections(season=season, week=week)
+        players = self.get_all_players()
+
+        if not projections or not players:
+            return set()
+
+        team_projected_pts: Dict[str, float] = {}
+        for pid, proj in projections.items():
+            if not proj or not isinstance(proj, dict):
+                continue
+            pinfo = players.get(str(pid), {})
+            team = pinfo.get("team")
+            if not team:
+                continue
+            pts = float(proj.get("pts_ppr", 0.0) or 0.0)
+            team_projected_pts[team] = team_projected_pts.get(team, 0.0) + pts
+
+        # Teams with 0 projected fantasy points are on bye
+        bye_teams = {t for t, pts in team_projected_pts.items() if pts == 0.0}
+        return bye_teams
+
+
 
     def get_all_players(self, force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
         """Fetches and caches the master dictionary of NFL players from Sleeper."""
