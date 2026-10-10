@@ -284,6 +284,9 @@ class FantasyAdvisor:
             gp = float(st.get("gp") or 0)
             pts = float(st.get("pts_ppr") or 0)
             ppg = round(pts / gp, 1) if gp > 0 else 0.0
+            snaps = float(st.get("off_snp", 0.0) or 0.0)
+            tm_snaps = float(st.get("tm_off_snp", 0.0) or 0.0)
+            snap_pct = round(snaps / tm_snaps, 2) if tm_snaps > 0 else (round(snaps / (gp * 65.0), 2) if gp > 0 else 0.0)
 
             cut_score = 50 if not is_starter else 15
             tag = ""
@@ -299,26 +302,48 @@ class FantasyAdvisor:
                 tag = "PROTECTED: Franchise starter on Bye Week - DO NOT DROP."
                 recommendation = "HOLD (BYE)"
                 alerts.append(f"🛡️ **{name}** is on Bye Week (Week {active_week}) — benched for schedule, not skill.")
-            elif tier == "ELEVATED_STARTER" or (is_elevated and is_starter):
+            elif (tier == "ELEVATED_STARTER" or is_elevated) and is_starter:
                 cut_score = 5
                 tag = f"CRITICAL HOLD: Elevated starter this week ({elevation.get('summary')})"
                 recommendation = "START/HOLD"
                 alerts.append(f"⚡ **{name}** is elevated to starter this week ({elevation.get('summary')}).")
+            elif (tier == "ELEVATED_STARTER" or is_elevated) and not is_starter:
+                # Elevated on paper, but benched. Detect if genuine workhorse vs timeshare committee back
+                if snap_pct < 0.45 and ppg < 8.0:
+                    cut_score = 40
+                    tag = f"Timeshare committee back ({int(snap_pct*100)}% snaps, {ppg:.1f} PPG in timeshare). High cut viability for upside."
+                    recommendation = "DROP_CANDIDATE"
+                else:
+                    cut_score = 15
+                    tag = f"High-volume elevated backup ({elevation.get('summary')})"
+                    recommendation = "HOLD_HANDCUFF"
             elif tier == "POTENTIAL_SURGE":
-                cut_score = 30
+                cut_score = 25
                 tag = f"CONTINGENCY HOLD: Starters ahead are Questionable ({elevation.get('summary')})"
                 recommendation = "HOLD_CONTINGENCY"
             elif tier == "ENTRENCHED_STARTER":
-                cut_score = 5
-                tag = f"Core starter for {team}"
-                recommendation = "HOLD"
+                if is_starter:
+                    cut_score = 5
+                    tag = f"Starting regular for {team}"
+                    recommendation = "HOLD"
+                else:
+                    if ppg < 7.0 and snap_pct < 0.50:
+                        cut_score = 35
+                        tag = f"Low-producing bench starter ({int(snap_pct*100)}% snaps, {ppg:.1f} PPG)"
+                        recommendation = "DROP_CANDIDATE"
+                    else:
+                        cut_score = 15
+                        tag = f"Core starter on bench ({ppg:.1f} PPG)"
+                        recommendation = "HOLD"
             elif tier == "BENCH_BACKUP":
-                if pos == "QB":
-                    cut_score += 25
-                if ppg < 6.5:
-                    cut_score += 20
-                tag = f"Cuttable backup ({elevation.get('summary')})"
-                recommendation = "DROP_CANDIDATE"
+                if ppg < 7.0 and snap_pct < 0.50:
+                    cut_score = 35
+                    tag = f"Low-volume backup ({elevation.get('summary')})"
+                    recommendation = "DROP_CANDIDATE"
+                else:
+                    cut_score = 25
+                    tag = f"Backup ({elevation.get('summary')})"
+                    recommendation = "HOLD"
 
             evaluated_players.append({
                 "player_id": str(pid),
