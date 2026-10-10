@@ -101,9 +101,23 @@ fantasy-intel news --query "Barkley"
 #### Situational Matchup & Starting Lineup Advice
 Connect directly to your Sleeper account:
 ```bash
-fantasy-intel matchup --username <YOUR_SLEEPER_USERNAME>
+fantasy-intel matchup
 ```
 *Evaluates your starters against your opponent, alerts you to injured starters, and suggests optimal bench substitutions.*
+
+#### 📱 Discord Bot (Mobile Fantasy Intelligence)
+Run your personal Discord bot to access all functionality from your phone:
+```bash
+fantasy-intel bot --token <YOUR_DISCORD_BOT_TOKEN>
+```
+*Available mobile Slash Commands:*
+- `/roster`: Full roster breakdown with health status
+- `/matchup`: Head-to-head matchup + recommended bench swaps
+- `/waivers`: Free agent sleeper targets unowned in your league
+- `/injuries`: Next-man-up NFL depth chart promotions
+- `/leagues`: View all active Sleeper leagues and standings
+- `/ask <question>`: Gemini AI analysis with your live team context injected
+- *Direct Message / Mention*: Mention `@Bot <question>` for conversational advice on your phone!
 
 ---
 

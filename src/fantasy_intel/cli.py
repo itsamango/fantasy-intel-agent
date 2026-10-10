@@ -613,11 +613,20 @@ def main():
     matchup_p.add_argument("--league-id", type=str, default=None, help="Optional Sleeper league ID")
     matchup_p.add_argument("--week", type=int, default=None, help="Optional NFL Week number")
 
+    # Bot command
+    bot_p = subparsers.add_parser("bot", help="Run the Discord bot for mobile fantasy intelligence")
+    bot_p.add_argument("--token", type=str, default=None, help="Discord Bot Token (or set DISCORD_BOT_TOKEN)")
+
     args = parser.parse_args()
 
     if not args.command:
         parser.print_help()
         sys.exit(0)
+
+    if args.command == "bot":
+        from fantasy_intel.bot import run_bot
+        run_bot(token=args.token)
+        return
 
     advisor = FantasyAdvisor()
 

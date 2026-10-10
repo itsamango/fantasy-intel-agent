@@ -82,12 +82,17 @@ To query the engine via the CLI, run with the virtualenv:
 
 6. **Current Sleeper Team, Opponent & Situational Advice**:
    ```bash
-   /Users/lukebenfer/PycharmProjects/fantasy-intel-agent/.venv/bin/fantasy-intel matchup --username <sleeper_username>
+   /Users/lukebenfer/PycharmProjects/fantasy-intel-agent/.venv/bin/fantasy-intel matchup
    ```
    *Options*:
    - `--league-id <id>`: Specific Sleeper league
    - `--week <num>`: Specific week
    *Returns*: Starting lineup comparison, bench, critical injury alerts for active starters, swap recommendations, and tactical notes against the opponent.
+
+7. **Discord Bot (Mobile Fantasy Intelligence)**:
+   ```bash
+   /Users/lukebenfer/PycharmProjects/fantasy-intel-agent/.venv/bin/fantasy-intel bot --token <token>
+   ```
 
 ---
 
