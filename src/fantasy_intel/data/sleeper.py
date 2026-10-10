@@ -64,6 +64,29 @@ class SleeperClient:
             logger.error(f"Error fetching trending drops from Sleeper: {e}")
             return []
 
+    def get_season_stats(self, season: int = 2026, force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
+        """Fetches and caches cumulative in-season player stats from Sleeper."""
+        cache_path = self.cache_dir / f"sleeper_stats_{season}.json"
+        if cache_path.exists() and not force_refresh:
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to read cached sleeper stats: {e}")
+
+        url = f"{SLEEPER_BASE_URL}/stats/nfl/regular/{season}"
+        try:
+            resp = requests.get(url, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            return data
+        except Exception as e:
+            logger.error(f"Failed to download sleeper season stats for {season}: {e}")
+            return {}
+
+
     def get_all_players(self, force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
         """Fetches and caches the master dictionary of NFL players from Sleeper."""
         cache_path = self.cache_dir / "sleeper_players.json"

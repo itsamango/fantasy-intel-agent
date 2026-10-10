@@ -32,9 +32,17 @@ class FantasyAdvisor:
 
     def _ensure_engines(self, seasons: List[int]):
         if self._waiver_engine is None or self._loaded_seasons != seasons:
-            weekly_with_snaps = self.loader.get_weekly_with_snaps(seasons=seasons)
-            self._waiver_engine = WaiverWireEngine(weekly_with_snaps)
-            self._trade_analyzer = TradeAnalyzer(weekly_with_snaps)
+            season = seasons[0] if seasons else 2026
+            if season >= 2025:
+                dataset = self.loader.get_sleeper_season_data(season=season)
+                if dataset.empty:
+                    from fantasy_intel.config import DEFAULT_SEASON
+                    dataset = self.loader.get_weekly_with_snaps(seasons=[DEFAULT_SEASON])
+            else:
+                dataset = self.loader.get_weekly_with_snaps(seasons=seasons)
+
+            self._waiver_engine = WaiverWireEngine(dataset)
+            self._trade_analyzer = TradeAnalyzer(dataset)
             self._loaded_seasons = seasons
 
     def get_waiver_sleepers(

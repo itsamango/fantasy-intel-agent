@@ -15,8 +15,8 @@ USER_CONFIG_DIR = Path.home() / ".fantasy_intel"
 USER_CONFIG_FILE = USER_CONFIG_DIR / "config.json"
 
 # Default season settings
-DEFAULT_SEASON = 2024
-DEFAULT_SEASONS = [2023, 2024]
+DEFAULT_SEASON = 2026
+DEFAULT_SEASONS = [2024, 2025, 2026]
 
 # Scoring systems
 SCORING_PPR = "ppr"

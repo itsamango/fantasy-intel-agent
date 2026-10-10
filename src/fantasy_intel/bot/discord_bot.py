@@ -141,9 +141,8 @@ def create_bot(advisor: Optional[FantasyAdvisor] = None) -> commands.Bot:
 
         try:
             pos_list = [p.strip().upper() for p in positions.split(",")] if positions else None
-            stats_season = season if season <= 2024 else 2024
             sleepers = advisor.get_waiver_sleepers(
-                season=stats_season,
+                season=season,
                 positions=pos_list,
                 league_id=lid,
                 limit=limit,

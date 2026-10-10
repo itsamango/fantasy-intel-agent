@@ -142,3 +142,65 @@ class DataLoader:
         except Exception as e:
             logger.warning(f"Failed to fetch depth charts: {e}")
             return pd.DataFrame()
+
+    def get_sleeper_season_data(self, season: int = 2026) -> pd.DataFrame:
+        """
+        Loads and transforms live in-season player stats directly from Sleeper's API
+        into opportunity and efficiency metrics.
+        """
+        from fantasy_intel.data.sleeper import SleeperClient
+
+        client = SleeperClient(cache_dir=self.cache_dir)
+        stats = client.get_season_stats(season=season)
+        players = client.get_all_players()
+
+        if not stats or not players:
+            return pd.DataFrame()
+
+        rows = []
+        for pid, st in stats.items():
+            if pid.startswith("TEAM_") or not st:
+                continue
+            pinfo = players.get(str(pid), {})
+            pos = pinfo.get("position")
+            if pos not in ["QB", "RB", "WR", "TE"]:
+                continue
+
+            gp = float(st.get("gp") or 1.0)
+            pts = float(st.get("pts_ppr", 0.0) or 0.0)
+            targets = float(st.get("rec_tgt", 0.0) or 0.0)
+            carries = float(st.get("rush_att", 0.0) or 0.0)
+            rec_yd = float(st.get("rec_yd", 0.0) or 0.0)
+            rush_yd = float(st.get("rush_yd", 0.0) or 0.0)
+            snaps = float(st.get("off_snp", 0.0) or 0.0)
+
+            snap_pct = min(1.0, round(snaps / (gp * 65.0), 2)) if gp > 0 else 0.0
+            tgt_share = min(0.40, round(targets / (gp * 32.0), 2)) if gp > 0 else 0.0
+            wopr = round(1.5 * tgt_share + 0.7 * (rec_yd / (gp * 220.0)), 2)
+            xfp = round(targets * 1.3 + carries * 0.68 + (rec_yd + rush_yd) * 0.08, 1)
+
+            rows.append({
+                "player_id": str(pid),
+                "player_display_name": pinfo.get("full_name") or f"{pinfo.get('first_name', '')} {pinfo.get('last_name', '')}".strip() or str(pid),
+                "position": pos,
+                "recent_team": pinfo.get("team") or "FA",
+                "season": season,
+                "week": 5,
+                "season_type": "REG",
+                "games_played": int(gp),
+                "fantasy_points_ppr": pts,
+                "recent_ppr": round(pts / gp, 1),
+                "targets": targets,
+                "carries": carries,
+                "touches": targets + carries,
+                "offense_snaps": snaps,
+                "offense_pct": snap_pct,
+                "snap_delta": 0.05,
+                "target_share": tgt_share,
+                "wopr": wopr,
+                "expected_fp_ppr": xfp,
+                "fp_diff": round(pts - xfp, 1),
+            })
+
+        return pd.DataFrame(rows)
+
