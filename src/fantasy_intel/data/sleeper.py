@@ -247,6 +247,31 @@ class SleeperClient:
             logger.error(f"Error fetching matchups for league {league_id} week {week}: {e}")
             return []
 
+    def get_league_transactions(self, league_id: str, week: int) -> List[Dict[str, Any]]:
+        """Fetch transactions for a league in a specific week."""
+        url = f"{SLEEPER_BASE_URL}/league/{league_id}/transactions/{week}"
+        try:
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error(f"Error fetching transactions for league {league_id} week {week}: {e}")
+            return []
+
+    def get_recent_dropped_player_ids(self, league_id: str, week: int, hours: int = 48) -> Set[str]:
+        """Identifies player IDs recently dropped within the waiver hold window."""
+        import time
+        tx = self.get_league_transactions(league_id, week)
+        now_ms = time.time() * 1000
+        cutoff_ms = now_ms - (hours * 3600 * 1000)
+        dropped_ids = set()
+        for t in tx:
+            drops = t.get("drops") or {}
+            created = t.get("created", 0)
+            if drops and created >= cutoff_ms:
+                dropped_ids.update(str(pid) for pid in drops.keys())
+        return dropped_ids
+
     def get_user_matchup_overview(
         self, league_id: str, user_id: str, week: Optional[int] = None
     ) -> Dict[str, Any]:

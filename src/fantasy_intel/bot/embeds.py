@@ -162,15 +162,26 @@ def create_waivers_embed(sleepers: pd.DataFrame, league_name: Optional[str] = No
         fp_act = row.get("fantasy_points_ppr", 0.0)
         fp_exp = row.get("expected_fp_ppr", 0.0)
 
-        field_title = f"{pname} ({team} {pos}) • Opp Index: {opp_idx}"
+        avail = row.get("availability", "FREE AGENT")
+        avail_badge = "🟢 FA" if avail == "FREE AGENT" else "🟡 WAIVER"
+        cat = row.get("add_category", "STANDARD_ADD")
+        cat_badge = {
+            "HIGH_PRIORITY_ADD": "⚡ PRIORITY",
+            "CONTINGENCY_ADD": "🎲 CONTINGENCY",
+            "IR_STASH_ONLY": "🚑 IR STASH",
+            "STANDARD_ADD": "📈 STANDARD",
+        }.get(cat, "")
+
+        field_title = f"{avail_badge} • {pname} ({team} {pos}) • {opp_idx} Opp [{cat_badge}]"
         inj = row.get("injury_status", "Healthy")
         role = row.get("depth_role", "")
         ir_badge = " 🚨 **[Eligible for IR Stash]**" if row.get("ir_eligible") else ""
+        note = row.get("strategic_note") or catalyst
 
         field_val = (
             f"**Health & Role**: {inj} [{role}]{ir_badge}\n"
             f"**Snaps**: {snaps} ({delta_str}) | **Actual / xFP**: {fp_act:.1f} / {fp_exp:.1f}\n"
-            f"*{catalyst}*"
+            f"*{note}*"
         )
         embed.add_field(name=field_title, value=field_val, inline=False)
 

@@ -67,23 +67,40 @@ class FantasyAdvisor:
 
         # If Sleeper league provided, filter out already rostered players
         if league_id:
+            state = self.sleeper.get_nfl_state()
+            active_week = week or int(state.get("week", 1))
             rostered_ids = self.sleeper.get_rostered_player_ids(league_id)
+            dropped_ids = self.sleeper.get_recent_dropped_player_ids(league_id, active_week)
             players_db = self.sleeper.get_all_players()
+
             # Map player names to sleeper IDs
             rostered_names = set()
+            dropped_names = set()
             for pid in rostered_ids:
                 pinfo = players_db.get(pid, {})
                 fname = pinfo.get("full_name", "").lower()
                 if fname:
                     rostered_names.add(fname)
+            for pid in dropped_ids:
+                pinfo = players_db.get(pid, {})
+                fname = pinfo.get("full_name", "").lower()
+                if fname:
+                    dropped_names.add(fname)
 
             # Filter candidates
             candidates["is_rostered"] = candidates["player_display_name"].apply(
                 lambda name: name.lower() in rostered_names
             )
+            candidates["is_waiver_hold"] = candidates["player_display_name"].apply(
+                lambda name: name.lower() in dropped_names
+            )
+            candidates["availability"] = candidates["is_waiver_hold"].apply(
+                lambda hold: "WAIVER CLAIM" if hold else "FREE AGENT"
+            )
             available = candidates[~candidates["is_rostered"]].head(limit)
             return available.reset_index(drop=True)
 
+        candidates["availability"] = "FREE AGENT"
         return candidates.head(limit).reset_index(drop=True)
 
     def get_trade_recommendations(

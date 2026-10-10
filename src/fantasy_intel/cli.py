@@ -47,8 +47,10 @@ def render_waivers(advisor: FantasyAdvisor, args):
     table.add_column("WOPR / Trg", justify="right")
     table.add_column("Actual / xFP", justify="right")
     table.add_column("Opp Index", justify="right", style="bold green")
+    table.add_column("Availability", justify="center")
+    table.add_column("Category", style="bold")
     table.add_column("Health / Role", style="yellow")
-    table.add_column("Catalyst & Context", style="dim")
+    table.add_column("Strategic Analysis", style="dim")
 
     for _, row in sleepers.iterrows():
         snap_pct = f"{int(row.get('offense_pct', 0) * 100)}%"
@@ -62,6 +64,21 @@ def render_waivers(advisor: FantasyAdvisor, args):
         ir_tag = " [bold magenta](IR Stash)[/bold magenta]" if row.get("ir_eligible") else ""
         health_role = f"{inj} [{role}]{ir_tag}"
 
+        avail = row.get("availability", "FREE AGENT")
+        avail_str = "[bold green]FREE AGENT[/bold green]" if avail == "FREE AGENT" else "[bold yellow]WAIVER CLAIM[/bold yellow]"
+        
+        cat = row.get("add_category", "STANDARD_ADD")
+        if cat == "HIGH_PRIORITY_ADD":
+            cat_style = "[bold green]PRIORITY ADD[/bold green]"
+        elif cat == "CONTINGENCY_ADD":
+            cat_style = "[bold yellow]CONTINGENCY[/bold yellow]"
+        elif cat == "IR_STASH_ONLY":
+            cat_style = "[bold magenta]IR STASH[/bold magenta]"
+        else:
+            cat_style = "[cyan]STANDARD[/cyan]"
+
+        note = str(row.get("strategic_note") or row.get("catalyst"))
+
         table.add_row(
             str(row.get("player_display_name")),
             str(row.get("position")),
@@ -71,8 +88,10 @@ def render_waivers(advisor: FantasyAdvisor, args):
             wopr_val,
             fp_str,
             str(row.get("opportunity_index")),
+            avail_str,
+            cat_style,
             health_role,
-            str(row.get("catalyst")),
+            note,
         )
 
     console.print(table)

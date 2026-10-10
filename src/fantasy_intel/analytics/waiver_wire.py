@@ -117,6 +117,47 @@ class WaiverWireEngine:
         filtered["situation"] = situations
         filtered["injury_status"] = inj_statuses
 
+        # Bayesian Vacancy & Availability Adjustments
+        adjusted_indices = []
+        categories = []
+        strategic_notes = []
+
+        for _, row in filtered.iterrows():
+            base_opp = float(row["opportunity_index"])
+            tier = row["elevation_tier"]
+            ir_eligible = row["ir_eligible"]
+            own_inj = row["injury_status"]
+            summary = row["situation"]
+
+            if ir_eligible:
+                # Out / IR stash: discount immediate week points, but maintain high rest-of-season stash ranking
+                adj_score = round(base_opp * 0.9, 1)
+                cat = "IR_STASH_ONLY"
+                note = f"STASH ASSET: Ruled {own_inj}. Eligible for open IR slot."
+            elif tier == "ELEVATED_STARTER":
+                # High-priority vacancy
+                adj_score = min(80.0, round(base_opp + 15.0, 1))
+                cat = "HIGH_PRIORITY_ADD"
+                note = f"IMMEDIATE STARTER: {summary}"
+            elif tier == "POTENTIAL_SURGE":
+                # Starters Questionable
+                adj_score = min(70.0, round(base_opp + 8.0, 1))
+                cat = "CONTINGENCY_ADD"
+                note = f"SURGE CANDIDATE: {summary}"
+            else:
+                adj_score = round(base_opp, 1)
+                cat = "STANDARD_ADD"
+                note = summary or "Standard depth"
+
+            adjusted_indices.append(adj_score)
+            categories.append(cat)
+            strategic_notes.append(note)
+
+        filtered["base_opportunity_index"] = filtered["opportunity_index"]
+        filtered["opportunity_index"] = adjusted_indices
+        filtered["add_category"] = categories
+        filtered["strategic_note"] = strategic_notes
+
         result_cols = [
             "player_display_name",
             "position",
@@ -129,7 +170,10 @@ class WaiverWireEngine:
             "wopr",
             "fantasy_points_ppr",
             "expected_fp_ppr",
+            "base_opportunity_index",
             "opportunity_index",
+            "add_category",
+            "strategic_note",
             "catalyst",
             "injury_status",
             "ir_eligible",
