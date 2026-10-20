@@ -39,7 +39,7 @@ def call_gemini_chat(prompt: str, context: str) -> str:
             f"**Based on current roster context:**\n{context[:1500]}"
         )
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
+    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-3.8-flash:generateContent?key={gemini_key}"
     full_prompt = (
         "You are an expert, highly strategic NFL Fantasy Football Assistant for Discord.\n"
         "Here is the user's current live fantasy team, matchup, and injury context:\n"
@@ -54,7 +54,7 @@ def call_gemini_chat(prompt: str, context: str) -> str:
     }
 
     try:
-        resp = requests.post(url, json=payload, timeout=12)
+        resp = requests.post(url, json=payload, timeout=35)
         if resp.status_code == 200:
             data = resp.json()
             return data["candidates"][0]["content"]["parts"][0]["text"].strip()
