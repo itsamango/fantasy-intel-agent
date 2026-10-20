@@ -8,11 +8,13 @@
 
 1. **Under-The-Radar Waiver Sleeper Detector**:
    - Moves beyond basic box scores by analyzing **leading opportunity metrics**: snap share trajectory ($\Delta \text{snaps}$), Weighted Opportunity Rating (WOPR), target share, and touch share.
-   - Catches breakouts *before* they have the multi-touchdown game that costs 40% of your FAAB.
+   - **Position-specific opportunity index (0–100)** so WR/TEs score via WOPR + unrealized air yards (RACR $< 0.75$) while RBs score via high-value touches (HVT) — one formula no longer locks either position out.
+   - **Dynamic FAAB bid sizing**: bids scaled by ΔVORP over your worst bench player, your league's empirical winning-bid history (Sleeper transactions), remaining budget, and standings urgency — with priority-claim recommendations for blind-bid leagues.
 
 2. **Buy-Low & Sell-High Trade Engine**:
-   - Calculates **Expected Fantasy Points (xFP)** and measures performance variance ($\text{Points} - xFP$).
-   - Highlights unlucky players due for positive regression (Buy-Low) and low-volume touchdown luck merchants (Sell-High).
+   - Calculates **situational Expected Fantasy Points (xFP)** and measures performance variance ($\text{FPOE} = \text{Points} - xFP$) with rolling 3-week exponentially weighted trends.
+   - Highlights unlucky players due for positive regression (Buy-Low: high rolling xFP, deeply negative rolling FPOE) and low-volume touchdown luck merchants (Sell-High: sustained $\text{FPOE} > +4.0$).
+   - **🤝 Bilateral League Trade Proposals** (`--username` / `--league-id`): scans every opponent roster and ranks 1-for-1 / 2-for-1 swaps using **dynamic league VORP**, the $\alpha = 0.72$ package consolidation penalty, a Pareto-benefit filter (both lineups must improve), and a logistic acceptance-probability score with a ready-to-send pitch.
 
 3. **Live News & Injury Context Engine**:
    - Ingests real-time RSS feeds from ESPN, ProFootballTalk, and beat reporters.
@@ -21,7 +23,7 @@
 4. **Sleeper API League & Matchup Integration**:
    - Live query of nationwide trending adds and drops across all fantasy leagues.
    - Filter waiver recommendations specifically against your private Sleeper league's rostered players.
-   - **Situational Matchup Inspector**: Inspect your starting lineup vs your opponent, detect active injuries, and receive tactical start/sit swap suggestions.
+   - **Matchup & Start/Sit Optimizer**: context-adjusted Floor/Median/Ceiling projections per starter and bench player — scaled by Vegas implied team totals, wind (≥15 mph outdoor downgrade for QBs/deep-threat WRs, RB boost), and opponent defensive EPA funnels — plus favorite/underdog posture detection ($\Delta M$) and an integer-linear-programming optimal lineup with mathematically justified start/sit swaps.
 
 5. **Antigravity Custom Skill**:
    - Includes `.agents/skills/fantasy-advisor/SKILL.md` so the agent can pair program and provide fantasy advice natively inside Antigravity!
@@ -72,9 +74,13 @@ Filter by position or against your Sleeper league:
 fantasy-intel waivers --positions WR,RB --league-id <YOUR_SLEEPER_LEAGUE_ID>
 ```
 
-#### Evaluate Trades (Buy-Low / Sell-High)
+#### Evaluate Trades (Buy-Low / Sell-High + Bilateral Proposals)
 ```bash
 fantasy-intel trades --season 2024
+```
+Add your Sleeper username and league ID to also rank 🤝 mutually beneficial 1-for-1 / 2-for-1 trade proposals against every roster in your league (dynamic VORP, package decay, Pareto filter, and acceptance probability):
+```bash
+fantasy-intel trades --username <YOUR_SLEEPER_USERNAME> --league-id <YOUR_SLEEPER_LEAGUE_ID>
 ```
 
 #### Live Trending Adds & Drops (Sleeper)
@@ -103,7 +109,7 @@ Connect directly to your Sleeper account:
 ```bash
 fantasy-intel matchup
 ```
-*Evaluates your starters against your opponent, alerts you to injured starters, and suggests optimal bench substitutions.*
+*Evaluates your starters against your opponent, alerts you to injured starters, projects Floor/Median/Ceiling for every starter and bench player (Vegas ITT, wind, and defensive funnel adjusted), flags your favorite/underdog posture (ΔM), and solves the mathematically optimal start/sit swaps via ILP.*
 
 #### 📱 Discord Bot (Mobile Fantasy Intelligence)
 Run your personal Discord bot to access all functionality from your phone:
@@ -131,8 +137,26 @@ This engine focuses on structural opportunity metrics:
   $$\text{WOPR} = 1.5 \times \text{Target Share} + 0.7 \times \text{Air Yards Share}$$
 * **Snap Share Momentum**:
   $$\Delta \text{Snap} = \text{Snap}_{\text{recent}} - \text{Snap}_{\text{prev\_avg}}$$
-* **Expected Fantasy Points (xFP)**:
-  $$\text{xFP} \approx (\text{Targets} \times 1.3) + (\text{Air Yards} \times 0.08) + (\text{Carries} \times 0.68)$$
+* **Situational Expected Fantasy Points (xFP)** — touch-level valuation stratified by field position (goal-line proximity and end-zone targets), not a flat per-touch average:
+  $$\text{xFP} = \underbrace{0.45 \cdot c_{\text{mid}} + 1.45 \cdot c_{10\text{-}6} + 2.65 \cdot c_{\text{inside 5}}}_{\text{rushing, by yard line}} + \underbrace{(0.65w_{\text{rec}} + 0.52) \cdot t_{\text{reg}} + 0.075 \cdot \text{air\_yds} + (0.42w_{\text{rec}} + 2.15) \cdot t_{\text{EZ}}}_{\text{receiving, catch-rate weighted}}$$
+* **Fantasy Points Over Expected (FPOE) & rolling trends**:
+  $$\text{FPOE} = \text{Actual Points} - \text{xFP}, \qquad \text{rolling 3-week EWM of xFP and FPOE}$$
+  High rolling xFP ($\ge 12.0$ PPG) with deeply negative rolling FPOE ($\le -3.0$) = **buy-low**; sustained $\text{FPOE} > +4.0$ on low xFP = **sell-high** (such players decline ~3.7 PPG over their next 3 games).
+* **Efficiency diagnostics**: RACR ($\text{rec yds} / \text{air yds}$, highly mean-reverting), unrealized air yards, and High-Value Touches ($\text{HVT} = \text{targets} + \text{carries inside the 10}$).
+
+### 🎯 Waiver Wire & FAAB Sizing
+* **Position-specific Opportunity Index (0–100)** — WR/TE: snap share (25) + WOPR (40) + snap surge (20) + unrealized air yards (15); RB: snap share (25) + HVT (35) + touches (25) + snap surge (15).
+* **Dynamic FAAB bids**: $\text{bid} = \min(B_{\text{rem}},\ \text{Bid}_{\text{clearing}} \times \frac{\Delta \text{VORP}}{\text{VORP}_{\max}} \times (\frac{B_{\text{rem}}}{B_{\text{init}}})^{\gamma} \times \phi_{\text{urgency}})$ using your league's empirical winning bids from Sleeper transaction history (priority-claim recommendations for blind-bid leagues).
+
+### 🤝 Bilateral Trade Valuation
+* **Dynamic VORP**: replacement rank $K_{\text{pos}} = N \times (S_{\text{pos}} + F_{\text{pos}}) + 1$ from your league's exact roster slots; $\text{VORP}_i = \max(0, P_i - P_{\text{replacement}})$.
+* **Package consolidation decay**: $\text{Value}_{\text{pkg}} = V_{(1)} + 0.72 \cdot V_{(2)} + \dots$ — two 10-point players are not one 20-point player.
+* **Pareto filter + acceptance score**: both managers' optimal lineups must improve; proposals are ranked by a logistic acceptance probability blending market-value parity, their lineup gain, and positional need.
+
+### ⚔️ Matchup & Start/Sit Optimization
+* **Context multipliers**: Vegas implied team total $\left(\text{ITT}/22.5\right)^{0.6}$; outdoor wind $\ge 15$ mph → $0.88\times$ QBs/deep-threat WRs (aDOT > 12) and $1.05\times$ RBs; opponent top-8 defensive EPA funnel → $1.08\times$.
+* **Floor / Median / Ceiling**: $P_{15}$ / $P_{50}$ / $P_{85}$ from a moment-matched log-normal over rolling xFP and trailing weekly variance.
+* **Posture & ILP**: favored by $\ge 10$ median pts → floor-protect ($0.65 P_{15} + 0.35 P_{50}$); underdog → chase ceiling ($0.65 P_{85} + 0.35 P_{50}$); the optimal lineup across your league's exact slots is solved with integer linear programming.
 
 ---
 

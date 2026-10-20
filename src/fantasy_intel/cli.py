@@ -15,6 +15,13 @@ from fantasy_intel.news.scraper import NewsCollector
 console = Console()
 
 
+def _fmt_int(val) -> str:
+    try:
+        return str(int(val))
+    except (TypeError, ValueError):
+        return "0"
+
+
 def render_waivers(advisor: FantasyAdvisor, args):
     """Render waiver sleepers table."""
     config = load_user_config()
@@ -33,6 +40,9 @@ def render_waivers(advisor: FantasyAdvisor, args):
         console.print("[yellow]No sleeper candidates found matching criteria.[/yellow]")
         return
 
+    has_faab = "recommended_faab_bid" in sleepers.columns and sleepers["recommended_faab_bid"].notna().any()
+    has_priority = "priority_claim_recommended" in sleepers.columns and not has_faab
+
     table = Table(
         title=f"🎯 Under-The-Radar Waiver Sleepers ({args.season} Week {args.week or 'Latest'})",
         box=box.ROUNDED,
@@ -45,8 +55,13 @@ def render_waivers(advisor: FantasyAdvisor, args):
     table.add_column("Snap %", justify="right")
     table.add_column("Snap Δ", justify="right")
     table.add_column("WOPR / Trg", justify="right")
-    table.add_column("Actual / xFP", justify="right")
+    table.add_column("HVT", justify="right")
+    table.add_column("RACR", justify="right")
     table.add_column("Opp Index", justify="right", style="bold green")
+    if has_faab:
+        table.add_column("Rec FAAB Bid", justify="right", style="bold green")
+    elif has_priority:
+        table.add_column("Priority Claim?", justify="center", style="bold green")
     table.add_column("Availability", justify="center")
     table.add_column("Category", style="bold")
     table.add_column("Health / Role", style="yellow")
@@ -57,7 +72,21 @@ def render_waivers(advisor: FantasyAdvisor, args):
         delta_val = row.get("snap_delta", 0)
         snap_delta = f"+{int(delta_val * 100)}%" if delta_val > 0 else f"{int(delta_val * 100)}%"
         wopr_val = f"{row.get('wopr', 0):.2f}" if row.get("wopr", 0) > 0 else f"{int(row.get('targets', 0))} trg"
-        fp_str = f"{row.get('fantasy_points_ppr', 0):.1f} / {row.get('expected_fp_ppr', 0):.1f}"
+        hvt_str = _fmt_int(row.get("hvt", 0))
+        racr_val = row.get("racr")
+        racr_str = f"{racr_val:.2f}" if isinstance(racr_val, (int, float)) and racr_val == racr_val else "—"
+
+        if has_faab:
+            bid_val = row.get("recommended_faab_bid")
+            if bid_val:
+                pct_val = row.get("faab_pct_of_remaining") or 0.0
+                bid_cell = f"[bold green]${_fmt_int(bid_val)}[/bold green] ({pct_val * 100:.0f}%)"
+            else:
+                bid_cell = "[dim]$0[/dim]"
+        elif has_priority:
+            bid_cell = "[bold green]YES[/bold green]" if row.get("priority_claim_recommended") else "[dim]no[/dim]"
+        else:
+            bid_cell = None
 
         inj = row.get("injury_status", "Healthy")
         role = row.get("depth_role", "")
@@ -79,30 +108,37 @@ def render_waivers(advisor: FantasyAdvisor, args):
 
         note = str(row.get("strategic_note") or row.get("catalyst"))
 
-        table.add_row(
+        cells = [
             str(row.get("player_display_name")),
             str(row.get("position")),
             str(row.get("recent_team")),
             snap_pct,
             snap_delta,
             wopr_val,
-            fp_str,
+            hvt_str,
+            racr_str,
             str(row.get("opportunity_index")),
-            avail_str,
-            cat_style,
-            health_role,
-            note,
-        )
+        ]
+        if bid_cell is not None:
+            cells.append(bid_cell)
+        cells.extend([avail_str, cat_style, health_role, note])
+        table.add_row(*cells)
 
     console.print(table)
 
 
 def render_trades(advisor: FantasyAdvisor, args):
-    """Render buy-low and sell-high regression candidates."""
+    """Render buy-low and sell-high regression candidates plus bilateral trade proposals."""
+    config = load_user_config()
+    username = args.username or config.get("sleeper_username")
+    league_id = args.league_id or config.get("default_league_id")
+
     with console.status("[bold green]Calculating Expected Fantasy Points (xFP) variance..."):
         trades = advisor.get_trade_recommendations(
             season=args.season,
             week=args.week,
+            league_id=league_id,
+            username=username,
         )
 
     # Buy Low Table
@@ -169,6 +205,52 @@ def render_trades(advisor: FantasyAdvisor, args):
         )
 
     console.print(sell_table)
+
+    proposals_bundle = trades.get("trade_proposals")
+    if proposals_bundle is None:
+        if league_id and not username:
+            console.print(
+                "[yellow]Bilateral trade proposals need a Sleeper username: "
+                "pass --username or run [bold cyan]fantasy-intel connect --username <user>[/bold cyan].[/yellow]"
+            )
+        return
+
+    cards = proposals_bundle.get("proposals") or []
+    if not cards:
+        console.print("[yellow]No mutually beneficial bilateral trade proposals found for this league.[/yellow]")
+        return
+
+    def player_cell(card):
+        text = f"{card['name']} ({card['position']})"
+        if card.get("tag"):
+            text += f", {card['tag']}"
+        return text
+
+    trade_table = Table(
+        title="🤝 Personalized Bilateral Trade Proposals",
+        box=box.ROUNDED,
+        header_style="bold green",
+    )
+    trade_table.add_column("Send", style="bold white")
+    trade_table.add_column("Receive", style="bold cyan")
+    trade_table.add_column("Target", style="magenta")
+    trade_table.add_column("Your Gain", justify="right", style="bold green")
+    trade_table.add_column("Their Gain", justify="right", style="green")
+    trade_table.add_column("P(accept)", justify="right", style="bold yellow")
+    trade_table.add_column("Pitch", style="dim")
+
+    for c in cards:
+        trade_table.add_row(
+            " + ".join(player_cell(p) for p in c["send"]),
+            " + ".join(player_cell(p) for p in c["receive"]),
+            str(c["target_manager"]),
+            f"+{c['your_lineup_gain']:.1f}",
+            f"+{c['their_lineup_gain']:.1f}",
+            f"{c['p_accept'] * 100:.0f}%",
+            str(c["pitch"]),
+        )
+
+    console.print(trade_table)
 
 
 def render_trending(advisor: FantasyAdvisor, args):
@@ -571,16 +653,93 @@ def render_matchup(advisor: FantasyAdvisor, args):
             alert_lines.append(f"[{color}]• [{a['severity']}] {a['action']}[/{color}]")
         console.print(Panel("\n".join(alert_lines), title="🚨 Starting Lineup Alerts", border_style="red"))
 
+    # Context-Adjusted Projections & Matchup Posture
+    projections = advice.get("player_projections") or []
+    user_projs = [p for p in projections if p.get("side") == "user"]
+    has_projections = any(float(p.get("median") or 0) > 0 for p in user_projs)
+
+    if has_projections:
+        posture = advice.get("posture")
+        delta_median = advice.get("delta_median") or 0.0
+        weights = advice.get("objective_weights") or {}
+        optimizer = advice.get("optimizer") or {}
+
+        posture_style = {
+            "FAVORITE": ("bold green", "FAVORITE (protect the floor)"),
+            "UNDERDOG": ("bold red", "UNDERDOG (chase the ceiling)"),
+            "NEUTRAL": ("bold yellow", "NEUTRAL (balanced)"),
+        }.get(posture, ("bold yellow", str(posture or "UNKNOWN")))
+
+        posture_lines = [
+            f"Matchup Posture: [{posture_style[0]}]{posture_style[1]}[/{posture_style[0]}] — "
+            f"ΔM [cyan]{delta_median:+.1f}[/cyan] "
+            f"(you [green]{optimizer.get('user_median_total', 0):.1f}[/green] vs opp "
+            f"[red]{optimizer.get('opponent_median_total', 0):.1f}[/red] projected median)",
+            f"Objective: {weights.get('floor', 0):.2f}×Floor + {weights.get('median', 0):.2f}×Median + "
+            f"{weights.get('ceiling', 0):.2f}×Ceiling",
+        ]
+        if optimizer.get("method"):
+            lineup = ", ".join(optimizer.get("optimal_lineup") or [])
+            posture_lines.append(f"Optimizer: {optimizer['method'].upper()} over league slots — optimal: {lineup}")
+        console.print(Panel("\n".join(posture_lines), title="⚖️ Matchup Posture & Optimizer", border_style="cyan"))
+
+        starter_names = {p.get("name") for p in my_starters}
+        proj_table = Table(
+            title="📊 Context-Adjusted Projections (Vegas ITT · Wind · Defensive Funnel)",
+            box=box.ROUNDED,
+            header_style="bold cyan",
+        )
+        proj_table.add_column("Player", style="bold white")
+        proj_table.add_column("Pos", style="magenta")
+        proj_table.add_column("Slot", justify="center")
+        proj_table.add_column("Floor", justify="right", style="green")
+        proj_table.add_column("Median", justify="right", style="bold cyan")
+        proj_table.add_column("Ceiling", justify="right", style="yellow")
+        proj_table.add_column("Mult", justify="right")
+        proj_table.add_column("Vegas / Weather Note", style="dim")
+
+        for p in user_projs:
+            slot = "[green]START[/green]" if p.get("name") in starter_names else "[dim]BENCH[/dim]"
+            status = p.get("status")
+            name = str(p.get("name") or "")
+            if status:
+                name += f" [red]({status})[/red]"
+
+            notes = " · ".join(str(n) for n in (p.get("notes") or []))
+            if "wind" in notes:
+                notes = f"[yellow]{notes} ⚠[/yellow]"
+            elif notes:
+                notes = f"[dim]{notes}[/dim]"
+
+            proj_table.add_row(
+                name,
+                str(p.get("position") or ""),
+                slot,
+                f"{float(p.get('floor') or 0):.1f}",
+                f"{float(p.get('median') or 0):.1f}",
+                f"{float(p.get('ceiling') or 0):.1f}",
+                f"x{float(p.get('multiplier') or 1.0):.2f}",
+                notes,
+            )
+
+        console.print(proj_table)
+
     # Tactical Substitutions & Strategy
     suggestions = advice.get("start_sit_suggestions", [])
     notes = advice.get("strategy_notes", [])
     if suggestions or notes:
         rec_lines = []
         for s in suggestions:
-            rec_lines.append(f"[bold green]• SWAP SUGGESTION:[/bold green] Bench [red]{s['sit']}[/red] ➔ Start [green]{s['start']}[/green] ({s['reason']})")
+            gain = s.get("projected_gain")
+            gain_str = f" ({gain:+.1f} adj pts)" if isinstance(gain, (int, float)) else ""
+            reason = s.get("reason") or ""
+            rec_lines.append(
+                f"[bold green]• SWAP SUGGESTION:[/bold green] Bench [red]{s['sit']}[/red] ➔ "
+                f"Start [green]{s['start']}[/green]{gain_str} — {reason}"
+            )
         for n in notes:
             rec_lines.append(f"[cyan]• TACTICAL NOTE:[/cyan] {n}")
-        console.print(Panel("\n".join(rec_lines), title="💡 Agent Recommendations & Strategy", border_style="green"))
+        console.print(Panel("\n".join(rec_lines), title="💡 Optimized Start/Sit Swaps & Strategy", border_style="green"))
 
 
 def render_drops(advisor: FantasyAdvisor, args):
@@ -668,7 +827,7 @@ def main():
 
     # Waivers command
     waivers_p = subparsers.add_parser("waivers", help="Find under-the-radar waiver wire sleepers")
-    waivers_p.add_argument("--season", type=int, default=DEFAULT_SEASON, help="NFL Season (default: 2024)")
+    waivers_p.add_argument("--season", type=int, default=DEFAULT_SEASON, help="NFL Season (default: 2026)")
     waivers_p.add_argument("--week", type=int, default=None, help="NFL Week number (default: latest)")
     waivers_p.add_argument("--positions", type=str, default=None, help="Comma-separated positions: WR,RB,TE")
     waivers_p.add_argument("--league-id", type=str, default=None, help="Sleeper league ID to filter out owned players")
@@ -676,8 +835,10 @@ def main():
 
     # Trades command
     trades_p = subparsers.add_parser("trades", help="Find buy-low and sell-high regression trade targets")
-    trades_p.add_argument("--season", type=int, default=DEFAULT_SEASON, help="NFL Season (default: 2024)")
+    trades_p.add_argument("--season", type=int, default=DEFAULT_SEASON, help="NFL Season (default: 2026)")
     trades_p.add_argument("--week", type=int, default=None, help="NFL Week number")
+    trades_p.add_argument("--username", type=str, default=None, help="Your Sleeper username or user_id (defaults to saved)")
+    trades_p.add_argument("--league-id", type=str, default=None, help="Sleeper league ID for bilateral trade proposals (defaults to saved)")
 
     # Trending command
     trending_p = subparsers.add_parser("trending", help="View Sleeper nationwide trending adds and drops")
@@ -699,18 +860,18 @@ def main():
     connect_p = subparsers.add_parser("connect", aliases=["config"], help="Connect your Sleeper account and save defaults")
     connect_p.add_argument("--username", type=str, required=True, help="Your Sleeper username")
     connect_p.add_argument("--league-id", type=str, default=None, help="Default Sleeper league ID")
-    connect_p.add_argument("--season", type=int, default=DEFAULT_SEASON, help="NFL Season (default: 2024)")
+    connect_p.add_argument("--season", type=int, default=DEFAULT_SEASON, help="NFL Season (default: 2026)")
 
     # Leagues command
     leagues_p = subparsers.add_parser("leagues", help="List all your Sleeper leagues, records, and points")
     leagues_p.add_argument("--username", type=str, default=None, help="Optional Sleeper username (defaults to saved)")
-    leagues_p.add_argument("--season", type=int, default=DEFAULT_SEASON, help="NFL Season (default: 2024)")
+    leagues_p.add_argument("--season", type=int, default=DEFAULT_SEASON, help="NFL Season (default: 2026)")
 
     # Roster command
     roster_p = subparsers.add_parser("roster", help="View your full roster, starters vs bench, and player injury status")
     roster_p.add_argument("--username", type=str, default=None, help="Optional Sleeper username (defaults to saved)")
     roster_p.add_argument("--league-id", type=str, default=None, help="Optional Sleeper league ID (defaults to active)")
-    roster_p.add_argument("--season", type=int, default=DEFAULT_SEASON, help="NFL Season (default: 2024)")
+    roster_p.add_argument("--season", type=int, default=DEFAULT_SEASON, help="NFL Season (default: 2026)")
 
     # Matchup command
     matchup_p = subparsers.add_parser("matchup", help="Inspect your current Sleeper team, opponent, and get tactical advice")

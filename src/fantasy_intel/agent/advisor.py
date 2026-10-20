@@ -1,17 +1,23 @@
 """Fantasy Intelligence Advisor orchestrating data, news, and league APIs."""
 
 from __future__ import annotations
+import logging
 from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from fantasy_intel.data.loader import DataLoader
 from fantasy_intel.data.sleeper import SleeperClient
-from fantasy_intel.analytics.waiver_wire import WaiverWireEngine
-from fantasy_intel.analytics.trades import TradeAnalyzer
+from fantasy_intel.data.weather import get_game_wind_forecast
+from fantasy_intel.analytics.metrics import _normalize_ids, add_projection_distributions, attach_pbp_features
+from fantasy_intel.analytics.waiver_wire import WaiverWireEngine, recommend_faab_bids
+from fantasy_intel.analytics.trades import TradeAnalyzer, generate_league_trade_proposals
 from fantasy_intel.analytics.depth_chart import DepthChartManager
-from fantasy_intel.analytics.matchups import MatchupAdvisor
+from fantasy_intel.analytics.matchups import MatchupAdvisor, compute_defensive_epa_rates
+from fantasy_intel.config import DEFAULT_SEASON, SCORING_PPR, load_user_config
 from fantasy_intel.news.scraper import NewsCollector
 from fantasy_intel.news.parser import NewsContextParser
+
+logger = logging.getLogger(__name__)
 
 
 class FantasyAdvisor:
@@ -29,21 +35,148 @@ class FantasyAdvisor:
         self._waiver_engine: Optional[WaiverWireEngine] = None
         self._trade_analyzer: Optional[TradeAnalyzer] = None
         self._loaded_seasons: List[int] = []
+        self._loaded_scoring: Optional[str] = None
 
-    def _ensure_engines(self, seasons: List[int]):
-        if self._waiver_engine is None or self._loaded_seasons != seasons:
+    def _ensure_engines(self, seasons: List[int], scoring: str = SCORING_PPR):
+        if (
+            self._waiver_engine is None
+            or self._loaded_seasons != seasons
+            or self._loaded_scoring != scoring
+        ):
             season = seasons[0] if seasons else 2026
             if season >= 2025:
-                dataset = self.loader.get_sleeper_season_data(season=season)
+                attached_seasons = [season]
+                dataset = self._nflverse_weekly_if_available(season)
+                if dataset is None:
+                    dataset = self.loader.get_sleeper_season_data(season=season)
                 if dataset.empty:
-                    from fantasy_intel.config import DEFAULT_SEASON
                     dataset = self.loader.get_weekly_with_snaps(seasons=[DEFAULT_SEASON])
+                    attached_seasons = [DEFAULT_SEASON]
             else:
                 dataset = self.loader.get_weekly_with_snaps(seasons=seasons)
+                attached_seasons = list(seasons)
 
-            self._waiver_engine = WaiverWireEngine(dataset)
+            # Enrich with PBP opportunity features so trajectories carry
+            # hvt / unrealized_air_yards / situational xFP (rolling_xfp_3w)
+            dataset = attach_pbp_features(dataset, self.loader, seasons=attached_seasons)
+
+            self._waiver_engine = WaiverWireEngine(dataset, scoring=scoring)
             self._trade_analyzer = TradeAnalyzer(dataset)
             self._loaded_seasons = seasons
+            self._loaded_scoring = scoring
+
+    def _nflverse_weekly_if_available(self, season: int) -> Optional[pd.DataFrame]:
+        """nflverse weekly frame for the season when published, else None.
+
+        Preferred over the Sleeper-derived frame for current seasons because
+        weekly granularity gives real rolling xFP / snap deltas plus native
+        racr / target_share / air_yards_share; the Sleeper path stays the
+        fallback when nflverse has not published that season yet.
+        """
+        try:
+            weekly = self.loader.get_weekly_with_snaps(seasons=[season])
+        except Exception as e:
+            logger.warning(f"nflverse weekly data unavailable for season {season}: {e}")
+            return None
+        if weekly.empty or "season" not in weekly.columns:
+            return None
+        if not (weekly["season"] == season).any():
+            return None
+        return weekly
+
+    def _resolve_sleeper_ids(self, player_ids: pd.Series) -> pd.Series:
+        """Maps a weekly frame's player ids (gsis or sleeper keyed) to Sleeper ids."""
+        ids_df = self.loader.get_player_ids()
+        normalized = _normalize_ids(player_ids)
+        if (
+            ids_df.empty
+            or "sleeper_id" not in ids_df.columns
+            or "gsis_id" not in ids_df.columns
+        ):
+            return normalized
+        gsis_to_sleeper = dict(zip(ids_df["gsis_id"], ids_df["sleeper_id"]))
+        frame_ids = set(normalized.dropna())
+        sleeper_overlap = len(frame_ids & set(ids_df["sleeper_id"].dropna()))
+        gsis_overlap = len(frame_ids & set(gsis_to_sleeper))
+        if sleeper_overlap >= gsis_overlap:
+            return normalized
+        return normalized.map(gsis_to_sleeper)
+
+    def _latest_sleeper_xfp(self) -> Dict[str, float]:
+        """Latest-week rolling 3-week xFP per player, keyed by Sleeper id."""
+        df = self._waiver_engine.df
+        if (
+            df is None
+            or df.empty
+            or "rolling_xfp_3w" not in df.columns
+            or "week" not in df.columns
+        ):
+            return {}
+        key = "player_id" if "player_id" in df.columns else "player_display_name"
+        sort_cols = [c for c in ("season", "week") if c in df.columns]
+        latest = df.sort_values(sort_cols, kind="stable").groupby(key, sort=False).tail(1)
+        sleeper_ids = self._resolve_sleeper_ids(latest[key])
+        return {
+            str(sid): float(xfp)
+            for sid, xfp in zip(sleeper_ids, latest["rolling_xfp_3w"])
+            if sid is not None and pd.notna(xfp)
+        }
+
+    def _build_user_roster(
+        self,
+        user_roster_record: Dict[str, Any],
+        players_db: Dict[str, Dict[str, Any]],
+    ) -> pd.DataFrame:
+        """Builds the user-roster frame consumed by recommend_faab_bids."""
+        starter_ids = {str(p) for p in (user_roster_record.get("starters") or []) if p}
+        xfp_by_sleeper_id = self._latest_sleeper_xfp()
+
+        rows = []
+        for pid in (user_roster_record.get("players") or []):
+            pid = str(pid)
+            p = players_db.get(pid, {})
+            rows.append({
+                "player_id": pid,
+                "player_display_name": p.get("full_name") or f"Player {pid}",
+                "position": p.get("position"),
+                "rolling_xfp_3w": xfp_by_sleeper_id.get(pid),
+                "is_starter": pid in starter_ids,
+                "injury_status": p.get("injury_status"),
+                "owner_id": user_roster_record.get("owner_id"),
+                "roster_id": user_roster_record.get("roster_id"),
+                "waiver_position": (user_roster_record.get("settings") or {}).get("waiver_position"),
+            })
+        return pd.DataFrame(rows)
+
+    def _attach_faab_recommendations(
+        self,
+        candidates: pd.DataFrame,
+        league_context: Dict[str, Any],
+        username_or_id: Optional[str],
+        rosters: List[Dict[str, Any]],
+        players_db: Dict[str, Dict[str, Any]],
+    ) -> pd.DataFrame:
+        """Adds FAAB bid / priority-claim recommendations based on the user's roster context."""
+        if not username_or_id:
+            username_or_id = load_user_config().get("sleeper_username")
+        if not username_or_id:
+            return candidates
+
+        user_info = self.sleeper.get_user(username_or_id)
+        user_id = user_info.get("user_id") if user_info else username_or_id
+        user_roster_record = next(
+            (r for r in rosters or [] if str(r.get("owner_id")) == str(user_id)), None
+        )
+        if not user_roster_record:
+            return candidates
+
+        user_roster = self._build_user_roster(user_roster_record, players_db)
+
+        faab_history = None
+        if league_context.get("waiver_type") != 0:
+            faab_history = self.sleeper.get_league_faab_history(league_id=league_context.get("league_id"))
+
+        return recommend_faab_bids(candidates, user_roster, league_context, faab_history)
 
     def get_waiver_sleepers(
         self,
@@ -52,9 +185,21 @@ class FantasyAdvisor:
         positions: Optional[List[str]] = None,
         league_id: Optional[str] = None,
         limit: int = 10,
+        username_or_id: Optional[str] = None,
     ) -> pd.DataFrame:
         """Finds under-the-radar waiver sleepers, optionally filtering out owned players in a Sleeper league."""
-        self._ensure_engines([season])
+        if not league_id:
+            league_id = load_user_config().get("default_league_id")
+
+        scoring = SCORING_PPR
+        league_context: Dict[str, Any] = {}
+        if league_id:
+            league_context = self.sleeper.get_league_context(league_id) or {}
+            league_scoring = league_context.get("scoring_type")
+            if league_scoring:
+                scoring = league_scoring
+
+        self._ensure_engines([season], scoring=scoring)
         candidates = self._waiver_engine.scan_sleepers(
             week=week,
             season=season,
@@ -65,56 +210,154 @@ class FantasyAdvisor:
         if candidates.empty:
             return pd.DataFrame()
 
-        # If Sleeper league provided, filter out already rostered players
-        if league_id:
-            state = self.sleeper.get_nfl_state()
-            active_week = week or int(state.get("week", 1))
-            rostered_ids = self.sleeper.get_rostered_player_ids(league_id)
-            dropped_ids = self.sleeper.get_recent_dropped_player_ids(league_id, active_week)
-            players_db = self.sleeper.get_all_players()
+        if not league_id:
+            candidates["availability"] = "FREE AGENT"
+            return candidates.head(limit).reset_index(drop=True)
 
-            # Map player names to sleeper IDs
-            rostered_names = set()
-            dropped_names = set()
-            for pid in rostered_ids:
-                pinfo = players_db.get(pid, {})
-                fname = pinfo.get("full_name", "").lower()
-                if fname:
-                    rostered_names.add(fname)
-            for pid in dropped_ids:
-                pinfo = players_db.get(pid, {})
-                fname = pinfo.get("full_name", "").lower()
-                if fname:
-                    dropped_names.add(fname)
+        state = self.sleeper.get_nfl_state()
+        active_week = week or int(state.get("week", 1))
+        rosters = self.sleeper.get_league_rosters(league_id)
+        rostered_ids = {str(p) for r in rosters or [] for p in (r.get("players") or [])}
+        dropped_ids = self.sleeper.get_recent_dropped_player_ids(league_id, active_week)
+        players_db = self.sleeper.get_all_players()
 
-            # Filter candidates
-            candidates["is_rostered"] = candidates["player_display_name"].apply(
-                lambda name: name.lower() in rostered_names
-            )
-            candidates["is_waiver_hold"] = candidates["player_display_name"].apply(
-                lambda name: name.lower() in dropped_names
-            )
-            candidates["availability"] = candidates["is_waiver_hold"].apply(
-                lambda hold: "WAIVER CLAIM" if hold else "FREE AGENT"
-            )
-            available = candidates[~candidates["is_rostered"]].head(limit)
-            return available.reset_index(drop=True)
+        # Name fallback for players the ID crosswalk cannot map
+        rostered_names = set()
+        dropped_names = set()
+        for pid in rostered_ids:
+            fname = players_db.get(pid, {}).get("full_name", "").lower()
+            if fname:
+                rostered_names.add(fname)
+        for pid in dropped_ids:
+            fname = players_db.get(pid, {}).get("full_name", "").lower()
+            if fname:
+                dropped_names.add(fname)
 
-        candidates["availability"] = "FREE AGENT"
-        return candidates.head(limit).reset_index(drop=True)
+        if "player_id" in candidates.columns:
+            candidate_sleeper_ids = self._resolve_sleeper_ids(candidates["player_id"])
+            candidates["sleeper_id"] = candidate_sleeper_ids
+            id_rostered = candidate_sleeper_ids.isin(rostered_ids)
+            id_dropped = candidate_sleeper_ids.isin(dropped_ids)
+        else:
+            id_rostered = pd.Series(False, index=candidates.index)
+            id_dropped = pd.Series(False, index=candidates.index)
+
+        name_rostered = candidates["player_display_name"].str.lower().isin(rostered_names)
+        name_dropped = candidates["player_display_name"].str.lower().isin(dropped_names)
+
+        # Filter candidates via sleeper_id (name fallback covers unmapped players)
+        candidates["is_rostered"] = id_rostered | name_rostered
+        candidates["is_waiver_hold"] = id_dropped | name_dropped
+        candidates["availability"] = candidates["is_waiver_hold"].apply(
+            lambda hold: "WAIVER CLAIM" if hold else "FREE AGENT"
+        )
+        available = candidates[~candidates["is_rostered"]].copy()
+
+        if not available.empty and league_context:
+            available = self._attach_faab_recommendations(
+                available, league_context, username_or_id, rosters, players_db
+            )
+
+        return available.head(limit).reset_index(drop=True)
 
     def get_trade_recommendations(
         self,
         season: int = 2024,
         week: Optional[int] = None,
         positions: Optional[List[str]] = None,
-    ) -> Dict[str, pd.DataFrame]:
-        """Returns buy-low and sell-high regression trade candidates."""
-        self._ensure_engines([season])
-        return {
+        league_id: Optional[str] = None,
+        username: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Returns buy-low and sell-high regression trade candidates.
+
+        When a Sleeper league and username are resolvable (params or saved
+        user config), also runs the bilateral trade engine against every
+        league roster and returns the ranked proposals as "trade_proposals".
+        """
+        if not league_id:
+            league_id = load_user_config().get("default_league_id")
+
+        scoring = SCORING_PPR
+        league_context: Dict[str, Any] = {}
+        if league_id:
+            league_context = self.sleeper.get_league_context(league_id) or {}
+            if league_context.get("scoring_type"):
+                scoring = league_context["scoring_type"]
+
+        self._ensure_engines([season], scoring=scoring)
+        result: Dict[str, Any] = {
             "buy_low": self._trade_analyzer.get_buy_low_candidates(season=season, week=week, positions=positions),
             "sell_high": self._trade_analyzer.get_sell_high_candidates(season=season, week=week, positions=positions),
         }
+        if not username:
+            username = load_user_config().get("sleeper_username")
+        if username:
+            proposals = self._bilateral_trade_proposals(
+                league_id=league_id,
+                league_context=league_context,
+                username=username,
+            )
+            if proposals is not None:
+                result["trade_proposals"] = proposals
+        return result
+
+    def _bilateral_trade_proposals(
+        self,
+        league_id: Optional[str],
+        league_context: Dict[str, Any],
+        username: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Runs the bilateral trade engine when the user's Sleeper roster is resolvable."""
+        try:
+            user_info = self.sleeper.get_user(username)
+            user_id = user_info.get("user_id") if user_info else username
+
+            if not league_id:
+                leagues = self.sleeper.get_user_leagues(user_id)
+                if not leagues:
+                    return None
+                league_id = leagues[0].get("league_id")
+            if not league_context:
+                league_context = self.sleeper.get_league_context(league_id) or {}
+                if not league_context:
+                    return None
+
+            rosters = self.sleeper.get_league_rosters(league_id)
+            if not rosters:
+                return None
+            user_roster_index = next(
+                (i for i, r in enumerate(rosters) if str(r.get("owner_id")) == str(user_id)),
+                None,
+            )
+            if user_roster_index is None:
+                return None
+
+            users = self.sleeper.get_league_users(league_id)
+            display_names = {
+                u.get("user_id"): (u.get("metadata") or {}).get("team_name") or u.get("display_name")
+                for u in users
+            }
+            manager_names = [
+                display_names.get(r.get("owner_id")) or f"Roster {r.get('roster_id')}"
+                for r in rosters
+            ]
+
+            metrics_df = self._latest_metrics_frame(self._waiver_engine.df)
+            if metrics_df is None or metrics_df.empty:
+                return None
+
+            return generate_league_trade_proposals(
+                metrics_df=metrics_df,
+                league_context=league_context,
+                rosters=[[str(p) for p in (r.get("players") or [])] for r in rosters],
+                user_roster_index=user_roster_index,
+                roster_ids=[r.get("roster_id") for r in rosters],
+                manager_names=manager_names,
+                players_db=self.sleeper.get_all_players(),
+            )
+        except Exception as e:
+            logger.warning(f"Bilateral trade evaluation failed: {e}")
+            return None
 
     def get_trending_movers(self, lookback_hours: int = 24) -> Dict[str, List[Dict[str, Any]]]:
         """Returns national trending adds and drops across fantasy football."""
@@ -194,8 +437,8 @@ class FantasyAdvisor:
         """
         Fetches the user's active matchup and delivers tailored tactical advice:
         - Injury alerts for active starters
-        - Recommended bench/starter swaps
-        - Opponent strengths/vulnerabilities
+        - Context-adjusted floor/median/ceiling projections (Vegas ITT / wind / defensive funnels)
+        - Matchup posture and mathematically optimized start/sit swaps
         """
         # Resolve username to user_id
         user_info = self.sleeper.get_user(username_or_id)
@@ -212,11 +455,89 @@ class FantasyAdvisor:
         if "error" in overview:
             return overview
 
-        eval_result = self.matchup_advisor.evaluate_lineup(overview)
+        advisor = self._build_matchup_advisor(overview, league_id)
+        eval_result = advisor.evaluate_lineup(overview)
         return {
             "matchup_overview": overview,
             "tactical_advice": eval_result,
         }
+
+    def _build_matchup_advisor(self, overview: Dict[str, Any], league_id: Optional[str]) -> MatchupAdvisor:
+        """Builds a projection-driven MatchupAdvisor; degrades to the bare advisor on any data failure."""
+        week = overview.get("week")
+
+        league_context: Dict[str, Any] = {}
+        if league_id:
+            try:
+                league_context = self.sleeper.get_league_context(league_id) or {}
+            except Exception:
+                league_context = {}
+
+        scoring = league_context.get("scoring_type") or SCORING_PPR
+        season = int(league_context.get("season") or DEFAULT_SEASON)
+
+        roster_positions = [
+            slot
+            for slot, count in (league_context.get("roster_position_counts") or {}).items()
+            for _ in range(int(count))
+        ]
+        if not roster_positions:
+            roster_positions = ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX"]
+        overview["roster_positions"] = roster_positions
+
+        metrics_df: Optional[pd.DataFrame] = None
+        try:
+            self._ensure_engines([season], scoring=scoring)
+            dataset = self._waiver_engine.df
+            if dataset is not None and not dataset.empty:
+                metrics_df = self._latest_metrics_frame(dataset)
+        except Exception:
+            metrics_df = None
+
+        schedules_df: Optional[pd.DataFrame] = None
+        try:
+            schedules = self.loader.get_schedules([season])
+            if not schedules.empty and week is not None and "week" in schedules.columns:
+                schedules = schedules[schedules["week"] == week]
+            if not schedules.empty:
+                schedules_df = schedules
+        except Exception:
+            schedules_df = None
+
+        def_epa_df: Optional[pd.DataFrame] = None
+        try:
+            features = self.loader.get_pbp_opportunity_features([season])
+            defense = features.get("defense") if isinstance(features, dict) else None
+            if defense is not None and not defense.empty:
+                def_epa_df = compute_defensive_epa_rates(defense, season=season, week=week)
+        except Exception:
+            def_epa_df = None
+
+        if metrics_df is None and schedules_df is None and def_epa_df is None:
+            return self.matchup_advisor
+
+        return MatchupAdvisor(
+            metrics_df=metrics_df,
+            schedules_df=schedules_df,
+            def_epa_df=def_epa_df if def_epa_df is not None and not def_epa_df.empty else None,
+            weather_fn=get_game_wind_forecast,
+        )
+
+    def _latest_metrics_frame(self, dataset: pd.DataFrame) -> pd.DataFrame:
+        """Latest per-player NFL-wide metrics rows with distribution projections and Sleeper ids."""
+        df = add_projection_distributions(dataset)
+        if df.empty:
+            return df
+        key = "player_id" if "player_id" in df.columns else "player_display_name"
+        sort_cols = [c for c in ("season", "week") if c in df.columns]
+        if sort_cols:
+            latest = df.sort_values(sort_cols, kind="stable").groupby(key, sort=False).tail(1).copy()
+        else:
+            latest = df.copy()
+        if "player_id" in latest.columns:
+            latest["sleeper_id"] = self._resolve_sleeper_ids(latest["player_id"])
+        return latest
+
 
     def get_user_leagues_overview(self, username_or_id: str, season: Optional[int] = None) -> List[Dict[str, Any]]:
         """Fetch summary of user's active leagues and performance."""
