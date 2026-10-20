@@ -3,15 +3,32 @@
 from __future__ import annotations
 import json
 import logging
+import math
+import time
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 import requests
 
-from fantasy_intel.config import CACHE_DIR
+from fantasy_intel.config import CACHE_DIR, SCORING_HALF_PPR, SCORING_PPR, SCORING_STANDARD, SCORING_TEP
 
 logger = logging.getLogger(__name__)
 
 SLEEPER_BASE_URL = "https://api.sleeper.app/v1"
+
+
+def _percentile(sorted_vals: List[float], p: float) -> float:
+    """Linear-interpolated percentile of an already-sorted list."""
+    if not sorted_vals:
+        return 0.0
+    if len(sorted_vals) == 1:
+        return float(sorted_vals[0])
+    k = (len(sorted_vals) - 1) * p
+    lo = math.floor(k)
+    hi = math.ceil(k)
+    if lo == hi:
+        return float(sorted_vals[lo])
+    return float(sorted_vals[lo]) * (hi - k) + float(sorted_vals[hi]) * (k - lo)
 
 
 class SleeperClient:
@@ -136,14 +153,16 @@ class SleeperClient:
 
 
     def get_all_players(self, force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
-        """Fetches and caches the master dictionary of NFL players from Sleeper."""
+        """Fetches and caches the master dictionary of NFL players from Sleeper (24h TTL)."""
         cache_path = self.cache_dir / "sleeper_players.json"
         if cache_path.exists() and not force_refresh:
-            try:
-                with open(cache_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.warning(f"Failed to read cached sleeper players: {e}")
+            age_hours = (time.time() - cache_path.stat().st_mtime) / 3600
+            if age_hours < 24:
+                try:
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        return json.load(f)
+                except Exception as e:
+                    logger.warning(f"Failed to read cached sleeper players: {e}")
 
         url = f"{SLEEPER_BASE_URL}/players/nfl"
         try:
@@ -258,9 +277,124 @@ class SleeperClient:
             logger.error(f"Error fetching transactions for league {league_id} week {week}: {e}")
             return []
 
+    def get_league_faab_history(self, league_id: str, weeks_back: int = 8) -> Dict[str, Any]:
+        """Summarizes completed FAAB waiver bids across recent transaction weeks.
+
+        Returns the league's empirical bid distribution: median, p80, count, and
+        the raw sorted winning bids (settings.waiver_bid of type=="waiver" and
+        status=="complete" transactions).
+        """
+        state = self.get_nfl_state()
+        current_week = int(state.get("week") or state.get("display_week") or 1)
+
+        weeks = list(range(max(1, current_week - weeks_back + 1), current_week + 1))
+        bids: List[int] = []
+        for wk in weeks:
+            transactions = self.get_league_transactions(league_id, wk)
+            for tx in transactions or []:
+                if tx.get("type") != "waiver" or tx.get("status") != "complete":
+                    continue
+                bid = (tx.get("settings") or {}).get("waiver_bid")
+                if isinstance(bid, (int, float)) and not isinstance(bid, bool):
+                    bids.append(int(bid))
+
+        if not bids:
+            return {"league_id": league_id, "median": None, "p80": None, "count": 0, "bids": []}
+
+        sorted_bids = sorted(bids)
+        return {
+            "league_id": league_id,
+            "median": _percentile(sorted_bids, 0.5),
+            "p80": _percentile(sorted_bids, 0.8),
+            "count": len(sorted_bids),
+            "bids": sorted_bids,
+        }
+
+    def get_league_context(self, league_id: str) -> Dict[str, Any]:
+        """Extracts league settings context for VORP/FAAB/lineup optimization.
+
+        Returns total_rosters, roster position slot counts (QB/RB/WR/TE/FLEX/
+        SUPER_FLEX/etc. from league roster_positions), scoring settings (rec,
+        bonus_rec_te, pass_td) with a detected scoring_type, and per-roster
+        records with remaining FAAB (league waiver budget minus used).
+        """
+        league = self.get_league_info(league_id)
+        rosters = self.get_league_rosters(league_id)
+        if not league:
+            return {}
+
+        settings = league.get("settings") or {}
+        scoring = league.get("scoring_settings") or {}
+        roster_positions = league.get("roster_positions") or []
+
+        position_counts = Counter(
+            slot for slot in roster_positions if isinstance(slot, str)
+        )
+
+        scoring_settings = {
+            key: scoring.get(key)
+            for key in ("rec", "bonus_rec_te", "pass_td")
+            if key in scoring
+        }
+
+        rec_weight = scoring.get("rec", 0.0) or 0.0
+        te_bonus = scoring.get("bonus_rec_te", 0.0) or 0.0
+        if rec_weight == 1.0 and te_bonus > 0:
+            scoring_type = SCORING_TEP
+        elif rec_weight == 1.0:
+            scoring_type = SCORING_PPR
+        elif rec_weight > 0:
+            scoring_type = SCORING_HALF_PPR
+        else:
+            scoring_type = SCORING_STANDARD
+
+        faab_budget = None
+        for key in ("waiver_budget", "budget_blind_bid"):
+            if isinstance(settings.get(key), (int, float)) and not isinstance(settings[key], bool):
+                faab_budget = int(settings[key])
+                break
+
+        roster_records = []
+        for roster in rosters or []:
+            roster_settings = roster.get("settings") or {}
+            faab_used = None
+            for key in ("waiver_budget_used", "budget_blind_bid_used"):
+                if isinstance(roster_settings.get(key), (int, float)) and not isinstance(
+                    roster_settings[key], bool
+                ):
+                    faab_used = int(roster_settings[key])
+                    break
+            faab_remaining = (
+                max(0, faab_budget - faab_used)
+                if faab_budget is not None and faab_used is not None
+                else None
+            )
+            roster_records.append(
+                {
+                    "roster_id": roster.get("roster_id"),
+                    "owner_id": roster.get("owner_id"),
+                    "wins": int(roster_settings.get("wins", 0) or 0),
+                    "losses": int(roster_settings.get("losses", 0) or 0),
+                    "ties": int(roster_settings.get("ties", 0) or 0),
+                    "faab_remaining": faab_remaining,
+                }
+            )
+
+        return {
+            "league_id": league_id,
+            "name": league.get("name"),
+            "season": league.get("season"),
+            "total_rosters": league.get("total_rosters") or len(rosters or []),
+            "roster_position_counts": dict(position_counts),
+            "scoring_settings": scoring_settings,
+            "scoring_type": scoring_type,
+            "faab_budget": faab_budget,
+            "waiver_type": settings.get("waiver_type"),
+            "rosters": roster_records,
+        }
+
     def get_recent_dropped_player_ids(self, league_id: str, week: int, hours: int = 48) -> Set[str]:
         """Identifies player IDs recently dropped within the waiver hold window."""
-        import time
         tx = self.get_league_transactions(league_id, week)
         now_ms = time.time() * 1000
         cutoff_ms = now_ms - (hours * 3600 * 1000)

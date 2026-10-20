@@ -22,6 +22,29 @@ DEFAULT_SEASONS = [2024, 2025, 2026]
 SCORING_PPR = "ppr"
 SCORING_HALF_PPR = "half_ppr"
 SCORING_STANDARD = "standard"
+SCORING_TEP = "tep"
+
+# Per-event scoring weights by scoring system. The "tep" rec weight is the
+# effective per-reception value for tight ends (PPR base + 0.5 TE premium);
+# non-TE positions in TEP leagues are valued with the "ppr" weights.
+SCORING_WEIGHTS: Dict[str, Dict[str, float]] = {
+    SCORING_PPR: {"rec": 1.0, "rush_yd": 0.1, "rec_yd": 0.1, "td": 6.0},
+    SCORING_HALF_PPR: {"rec": 0.5, "rush_yd": 0.1, "rec_yd": 0.1, "td": 6.0},
+    SCORING_STANDARD: {"rec": 0.0, "rush_yd": 0.1, "rec_yd": 0.1, "td": 6.0},
+    SCORING_TEP: {"rec": 1.5, "rush_yd": 0.1, "rec_yd": 0.1, "td": 6.0},
+}
+
+# Trade package valuation
+PACKAGE_CONSOLIDATION_ALPHA = 0.72
+
+# Matchup / lineup optimization
+WIND_PENALTY_THRESHOLD_MPH = 15
+MATCHUP_POSTURE_MARGIN = 10.0
+
+# FAAB bid sizing
+FAAB_GAMMA = 0.65
+FAAB_URGENCY_HIGH = 1.25
+FAAB_URGENCY_LOW = 0.85
 
 # Key fantasy positions
 SKILL_POSITIONS = ["QB", "RB", "WR", "TE"]
