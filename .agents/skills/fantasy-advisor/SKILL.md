@@ -5,8 +5,9 @@ description: >-
   user asks whether to accept, offer, or counter a trade ("should I trade X for Y", "is this
   fair", "what should I counter with"), wants trade ideas for their league, waiver/FAAB pickups,
   start/sit or matchup advice, buy-low / sell-high targets, injury fallout (next man up), or
-  breaking news impact. Evaluates trades by rest-of-season lineup impact and championship odds
-  for BOTH teams plus FantasyCalc market value.
+  breaking news impact, or who to pick up / drop. Evaluates trades and waiver moves by
+  rest-of-season lineup impact and championship odds (both teams for trades) plus FantasyCalc
+  market value.
 ---
 
 # Fantasy Advisor
@@ -23,6 +24,9 @@ has several leagues: when they name one (e.g. "my work league"), run `$FI league
 `--league-id`. Never assume the default league is the one they mean.
 
 Never pass `--season` unless the user asks about a past season; the default is the current season.
+
+Prefer `--json` (available on `trade-eval`, `waiver-moves`, `trades`, `waivers`): stdout is pure
+JSON, progress and warnings go to stderr. Read the human tables only for commands without it.
 
 ## Workflows
 
@@ -50,18 +54,31 @@ Never pass `--season` unless the user asks about a past season; the default is t
 
 ### "Find me trades" / "who should I trade with"
 
-`$FI trades --league-id <id>` prints buy-low / sell-high lists and ranked proposals with
-columns Δ Title (you), Market, Likelihood. Prefer LIKELY/PLAUSIBLE proposals. Before
-recommending one, run it through `trade-eval --json` to get both lineups and sweeteners.
-"0 proposals" is a legitimate answer (no realistic trade raises the user's title odds); then
-point the user to the free waiver moves instead.
+`$FI trades --league-id <id> --json` returns `buy_low`, `sell_high`, and
+`trade_proposals.proposals` (each with `your_title_delta`, `their_title_delta`,
+`your_lineup_gain`, `market_tier`, `market_delta`, `sweeteners`, `pitch`) plus
+`trade_proposals.current_odds`. Prefer LIKELY/PLAUSIBLE proposals. Before recommending one, run
+it through `trade-eval --json` to get both lineups and sweeteners. "0 proposals" is a
+legitimate answer (no realistic trade raises the user's title odds); then run `waiver-moves`.
 
-### Waivers / FAAB
+### Waivers: "who should I pick up / drop?"
 
-- `$FI waivers --league-id <id> --limit 10` for opportunity-based sleepers (snap/target/HVT
-  surges) and FAAB bids.
-- Any `trade-eval` result also lists `you.waiver_moves`: the best free drop→add swaps by
-  rest-of-season value. These are often worth more than any trade; always mention them.
+1. `$FI waiver-moves --league-id <id> --json`: the best free drop→add swaps by
+   rest-of-season value, in priority order. Each move has `gain_ppw`, `cumulative_ppw`,
+   `odds_after` (title/playoffs/bye), and `add`/`drop` cards (team, injury, byes, ROS pts/week,
+   market value). `before.odds` / `after.odds` show the total effect; `alternatives` are
+   runner-up claims if a target gets taken; `waiver_type` / `faab_remaining` give the budget.
+2. If a `drop` has `has_trade_value: true`, tell the user to shop that player (e.g. as a trade
+   sweetener) before cutting him.
+3. For speculative adds (breakouts before they show up in projections), add
+   `$FI waivers --league-id <id> --json` (opportunity index from snap/target/high-value-touch
+   surges, FAAB bid suggestions). `waiver-moves` values players on current projections;
+   `waivers` finds rising usage. Mention both when they disagree.
+4. Check news on any add with an injury tag or a sudden projection jump before recommending a
+   big FAAB bid.
+
+Free waiver moves often matter more than any trade (in testing, three pickups doubled a team's
+title odds). Mention them whenever you answer a trade question too (`you.waiver_moves`).
 
 ### Start/sit, matchup, injuries, news
 

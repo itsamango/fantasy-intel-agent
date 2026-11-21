@@ -43,6 +43,15 @@ All constants live in `src/fantasy_intel/config.py`.
   drop→add swaps (up to 3, ≥ 0.1 pts/week each; traded players can't be dropped). Without
   this, any trade that opens a roster spot gets credit for a free pickup.
 
+## waiver-moves
+
+- Pool: top 10 unrostered players per position by ROS projection (Sleeper does not expose
+  per-league waiver status).
+- Greedy swaps (drop one of the 6 lowest-ROS active players, add a free agent) while a swap
+  gains ≥ 0.1 pts/week; up to `--max-moves` (default 3). Odds re-simulated after each step.
+- `alternatives`: best single swap for each remaining free agent from the final roster.
+- `has_trade_value`: suggested drop worth ≥ 500 on FantasyCalc.
+
 ## Standings / title odds
 
 - 4,000 simulated seasons: remaining schedule from Sleeper matchups, current records (ties =
