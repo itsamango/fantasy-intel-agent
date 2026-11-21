@@ -83,6 +83,14 @@ Add your Sleeper username and league ID to also rank 🤝 mutually beneficial 1-
 fantasy-intel trades --username <YOUR_SLEEPER_USERNAME> --league-id <YOUR_SLEEPER_LEAGUE_ID>
 ```
 
+#### Evaluate a Specific Trade (rest-of-season + title odds + market)
+```bash
+fantasy-intel trade-eval --league-id <LEAGUE_ID> --give "Deebo Samuel" --get "Breece Hall" [--json]
+```
+*Simulates both teams' lineups for every remaining week (Sleeper projections, byes, injury tags, random availability, roster limits), measures the trade against each team's waiver-optimized roster, runs 4,000 season simulations on your real schedule and standings to report playoff / bye / title odds before and after, and checks FantasyCalc market value to estimate whether the partner accepts (with sweetener suggestions that never sell low).*
+
+`fantasy-intel trades` uses the same engine to search 1-for-1 / 2-for-1 / 1-for-2 swaps with every roster and ranks them by your change in title odds.
+
 #### Live Trending Adds & Drops (Sleeper)
 ```bash
 fantasy-intel trending --hours 24
