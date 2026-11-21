@@ -242,3 +242,34 @@ def test_waiver_baseline_removes_credit_for_free_pickups():
     _, moves = optimize_waivers(v, you, ["miller"], keep=["junk"])
     assert all(m["drop"] != "junk" for m in moves)
     assert fair["you"]["lineup_after"]["starters"][0] == {"slot": "RB", "name": "R1", "position": "RB", "ppw": 12.0}
+
+
+def test_plan_waiver_moves_reports_steps_odds_and_alternatives():
+    import numpy as np
+    from fantasy_intel.analytics.ros_value import plan_waiver_moves
+    from fantasy_intel.analytics.standings import SeasonSimulator, SeasonState
+
+    shape = LeagueShape({"QB": 0, "RB": 1, "WR": 1, "TE": 0}, {"FLEX": 1}, 4, 0, WEEKS, {15, 16, 17})
+    outlooks = {
+        "r1": _o("r1", "RB", 12, 0.9), "w1": _o("w1", "WR", 12, 0.9), "f": _o("f", "WR", 6, 0.9),
+        "junk": _o("junk", "RB", 1, 0.9),
+        "star_fa": _o("star_fa", "RB", 10, 0.9), "meh_fa": _o("meh_fa", "WR", 2, 0.9),
+    }
+    v = RosValuator(shape, outlooks, n_sims=200)
+    roster = RosterState(["r1", "w1", "f", "junk"], [])
+    state = SeasonState(
+        team_keys=[0, 1], wins=np.array([5.0, 5.0]), points_for=np.zeros(2),
+        schedule={11: [(0, 1)], 12: [(0, 1)], 13: [(0, 1)], 14: [(0, 1)]},
+        regular_weeks=[11, 12, 13, 14], playoff_rounds=[[15], [16, 17]], playoff_teams=2, weekly_sd=10.0,
+    )
+    season = {"sim": SeasonSimulator(state, n_sims=2000), "base_means": np.full((2, 7), 30.0), "user_index": 0}
+    season["base_means"][0] = [v.team_value(roster.all_ids()).per_week[w] for w in WEEKS]
+
+    plan = plan_waiver_moves(v, roster, ["star_fa", "meh_fa"], season=season)
+    first = plan["moves"][0]
+    assert first["add"]["player_id"] == "star_fa"
+    assert first["drop"]["player_id"] in ("junk", "f")
+    assert first["cumulative_ppw"] == pytest.approx(first["gain_ppw"], abs=0.01)
+    assert plan["after"]["ppw"] > plan["before"]["ppw"]
+    assert plan["after"]["odds"]["title"] > plan["before"]["odds"]["title"]
+    assert all(a["add"]["player_id"] != "star_fa" for a in plan["alternatives"])

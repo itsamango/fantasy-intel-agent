@@ -480,6 +480,93 @@ def optimize_waivers(
     return r, moves
 
 
+def plan_waiver_moves(
+    valuator: RosValuator,
+    roster: RosterState,
+    free_agents: Sequence[str],
+    season: Optional[Mapping[str, Any]] = None,
+    max_swaps: int = ROS_WAIVER_MAX_SWAPS,
+    n_alternatives: int = 5,
+) -> Dict[str, Any]:
+    """Best free drop->add moves for one roster, with cumulative value and odds.
+
+    Moves come from optimize_waivers (greedy, simulated ROS value). Each step
+    reports its own gain and the running totals; with `season` (as in
+    evaluate_trade, partner_index unused) playoff / bye / title odds are
+    re-simulated after every step. `alternatives` lists the next-best single
+    swaps from the final roster (the runner-up claims if a top target is taken).
+    """
+    n_weeks = max(1, len(valuator.shape.weeks))
+    _, moves = optimize_waivers(valuator, roster, free_agents, max_swaps=max_swaps)
+
+    def card(pid: Optional[str]) -> Optional[Dict[str, Any]]:
+        if pid is None or pid not in valuator.outlooks:
+            return None
+        o = valuator.outlooks[pid]
+        return {
+            "player_id": pid, "name": o.name, "position": o.position, "team": o.team,
+            "injury_status": o.injury_status, "ros_ppw": round(o.ros_expected() / n_weeks, 2),
+            "byes": [w for w in valuator.shape.weeks if o.source.get(w) == "bye"],
+        }
+
+    def odds_for(per_week: Mapping[int, float]) -> Optional[Dict[str, float]]:
+        if not season:
+            return None
+        sim, ui = season["sim"], season["user_index"]
+        means = np.array(season["base_means"], dtype=float, copy=True)
+        for j, w in enumerate(sim.state.weeks):
+            if w in per_week:
+                means[ui, j] = per_week[w]
+        return sim.run(means).for_team(ui)
+
+    cur = roster.copy()
+    v0 = valuator.team_value(cur.all_ids(), "sim")
+    before = {"ppw": round(v0.total / n_weeks, 2), "odds": odds_for(v0.per_week)}
+    steps: List[Dict[str, Any]] = []
+    for m in moves:
+        if m["drop"] is not None:
+            cur.active = [p for p in cur.active if p != m["drop"]]
+        cur.active.append(m["add"])
+        v = valuator.team_value(cur.all_ids(), "sim")
+        steps.append({
+            "drop": card(m["drop"]),
+            "add": card(m["add"]),
+            "gain_ppw": m["gain_ppw"],
+            "cumulative_ppw": round((v.total - v0.total) / n_weeks, 2),
+            "cumulative_playoffs": round(v.playoffs - v0.playoffs, 2),
+            "odds_after": odds_for(v.per_week),
+        })
+
+    # Runner-up single swaps from the final roster (best drop for each remaining FA)
+    base = valuator.team_value(cur.all_ids(), "sim").total
+    droppable = sorted(
+        (p for p in cur.active if p in valuator.outlooks),
+        key=lambda p: valuator.outlooks[p].ros_expected(),
+    )[:ROS_WAIVER_DROP_CANDIDATES]
+    alts: List[Dict[str, Any]] = []
+    for f in free_agents:
+        if f not in valuator.outlooks or f in cur.all_ids():
+            continue
+        best_gain, best_drop = None, None
+        for d in droppable:
+            g = valuator.team_value([q for q in cur.all_ids() if q != d] + [f], "sim").total - base
+            if best_gain is None or g > best_gain:
+                best_gain, best_drop = g, d
+        if best_gain is not None:
+            alts.append({"add": card(f), "drop": card(best_drop), "gain_ppw": round(best_gain / n_weeks, 2)})
+    alts.sort(key=lambda a: a["gain_ppw"], reverse=True)
+
+    after_v = valuator.team_value(cur.all_ids(), "sim")
+    return {
+        "weeks": list(valuator.shape.weeks),
+        "before": before,
+        "after": {"ppw": round(after_v.total / n_weeks, 2), "odds": odds_for(after_v.per_week)},
+        "moves": steps,
+        "alternatives": alts[:n_alternatives],
+        "min_gain_ppw": ROS_WAIVER_MIN_GAIN_PPW,
+    }
+
+
 def representative_lineup(valuator: RosValuator, ids: Iterable[str]) -> Dict[str, List[Dict[str, Any]]]:
     """Typical starting lineup by average ROS points per week (for display; weekly
     lineups vary with byes and injuries)."""

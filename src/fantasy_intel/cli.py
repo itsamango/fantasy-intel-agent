@@ -26,8 +26,14 @@ def render_waivers(advisor: FantasyAdvisor, args):
     """Render waiver sleepers table."""
     config = load_user_config()
     league_id = args.league_id or config.get("default_league_id")
+    positions = [p.strip().upper() for p in args.positions.split(",")] if args.positions else None
+    if getattr(args, "json", False):
+        sleepers = advisor.get_waiver_sleepers(
+            season=args.season, week=args.week, positions=positions, league_id=league_id, limit=args.limit
+        )
+        emit_json({"sleepers": sleepers, "data_through_week": getattr(advisor, "data_through_week", None)})
+        return
     with console.status("[bold green]Analyzing snap trajectories and opportunity metrics..."):
-        positions = [p.strip().upper() for p in args.positions.split(",")] if args.positions else None
         sleepers = advisor.get_waiver_sleepers(
             season=args.season,
             week=args.week,
@@ -132,6 +138,21 @@ def render_trades(advisor: FantasyAdvisor, args):
     config = load_user_config()
     username = args.username or config.get("sleeper_username")
     league_id = args.league_id or config.get("default_league_id")
+
+    if getattr(args, "json", False):
+        trades = advisor.get_trade_recommendations(
+            season=args.season, week=args.week, league_id=league_id, username=username
+        )
+        bundle = dict(trades.get("trade_proposals") or {})
+        if bundle.get("proposals"):
+            # full per-trade detail is available via `trade-eval --json`
+            bundle["proposals"] = [{k: v for k, v in p.items() if k != "ros"} for p in bundle["proposals"]]
+        emit_json({
+            "buy_low": trades.get("buy_low"),
+            "sell_high": trades.get("sell_high"),
+            "trade_proposals": bundle or None,
+        })
+        return
 
     with console.status("[bold green]Calculating Expected Fantasy Points (xFP) variance..."):
         trades = advisor.get_trade_recommendations(
@@ -842,6 +863,131 @@ def render_drops(advisor: FantasyAdvisor, args):
     console.print(table)
 
 
+def to_jsonable(obj):
+    """Recursively converts engine output (DataFrames, numpy scalars, NaN) to JSON-safe values."""
+    import math
+
+    import numpy as np
+    import pandas as pd
+
+    if isinstance(obj, pd.DataFrame):
+        return [to_jsonable(r) for r in obj.to_dict(orient="records")]
+    if isinstance(obj, pd.Series):
+        return to_jsonable(obj.to_dict())
+    if isinstance(obj, dict):
+        return {str(k): to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [to_jsonable(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return [to_jsonable(v) for v in obj.tolist()]
+    if isinstance(obj, np.generic):
+        obj = obj.item()
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    if obj is pd.NaT:
+        return None
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    return str(obj)
+
+
+def emit_json(payload) -> None:
+    """Writes JSON to the real stdout. In --json mode main() redirects sys.stdout to
+    stderr, because libraries (nfl_data_py) print progress lines on data refreshes."""
+    import json
+
+    out = sys.__stdout__
+    out.write(json.dumps(to_jsonable(payload), indent=2) + "\n")
+    out.flush()
+
+
+def render_waiver_moves(advisor: FantasyAdvisor, args):
+    """Best free drop -> add moves by rest-of-season value and title odds."""
+    try:
+        if args.json:
+            result = advisor.get_waiver_moves(league_id=args.league_id, username=args.username, max_moves=args.max_moves)
+        else:
+            with console.status("[bold green]Searching free agents against your rest-of-season lineup..."):
+                result = advisor.get_waiver_moves(
+                    league_id=args.league_id, username=args.username, max_moves=args.max_moves
+                )
+    except ValueError as e:
+        if args.json:
+            emit_json({"error": str(e)})
+        else:
+            console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+    if args.json:
+        emit_json(result)
+        return
+
+    def who(c):
+        if not c:
+            return "—"
+        extra = f", {c['injury_status']}" if c.get("injury_status") else ""
+        byes = f", bye W{','.join(map(str, c['byes']))}" if c.get("byes") else ""
+        return f"{c['name']} ({c['position']} {c.get('team') or 'FA'}{extra}{byes}) {c['ros_ppw']:.1f}/wk"
+
+    def odds_text(o):
+        return f"title {o['title']:.1%} · playoffs {o['playoffs']:.0%} · bye {o['bye']:.0%}" if o else "—"
+
+    weeks = result["weeks"]
+    head = [f"[bold]Now:[/bold] {odds_text(result['before'].get('odds'))}"]
+    if result["moves"]:
+        head.append(
+            f"[bold]After all moves:[/bold] {odds_text(result['after'].get('odds'))}  "
+            f"([green]{result['after']['ppw'] - result['before']['ppw']:+.2f} pts/wk[/green])"
+        )
+    budget = ""
+    if result.get("waiver_type") == "FAAB" and result.get("faab_remaining") is not None:
+        budget = f" · FAAB ${result['faab_remaining']} of ${result.get('faab_budget') or '?'} left"
+    console.print(Panel(
+        "\n".join(head),
+        title=f"🆓 Waiver moves · {result.get('league_name') or ''} · weeks {weeks[0]}–{weeks[-1]}{budget}",
+        box=box.ROUNDED,
+    ))
+
+    if not result["moves"]:
+        console.print(f"[yellow]No free agent improves your rest-of-season lineup by ≥ {result['min_gain_ppw']} pts/wk.[/yellow]")
+    else:
+        t = Table(title="Recommended moves (in priority order)", box=box.ROUNDED, header_style="bold green")
+        for col, kw in (("#", {"justify": "right"}), ("Add", {"style": "bold white"}), ("Drop", {}),
+                        ("Gain", {"justify": "right", "style": "green"}), ("Running total", {"justify": "right"}),
+                        ("Title odds after", {"justify": "right"}), ("Market value", {"justify": "right"})):
+            t.add_column(col, **kw)
+        for i, m in enumerate(result["moves"], 1):
+            odds = m.get("odds_after")
+            t.add_row(
+                str(i), who(m["add"]), who(m["drop"]) if m["drop"] else "(open roster spot)",
+                f"{m['gain_ppw']:+.2f}/wk" if m.get("gain_ppw") is not None else "—",
+                f"{m['cumulative_ppw']:+.2f}/wk ({m['cumulative_playoffs']:+.1f} playoffs)",
+                f"{odds['title']:.1%}" if odds else "—",
+                f"{m['add'].get('market_value', 0):,}" if m.get("add") else "—",
+            )
+        console.print(t)
+        for m in result["moves"]:
+            d = m.get("drop") or {}
+            if d.get("has_trade_value"):
+                console.print(
+                    f"[yellow]⚠ {d['name']} still has trade value ({d.get('market_value', 0):,} on FantasyCalc): "
+                    f"try to trade him (e.g. as a sweetener) before dropping him for {m['add']['name']}.[/yellow]"
+                )
+
+    if result["alternatives"]:
+        alt = Table(title="Runner-up claims (if a target is taken)", box=box.SIMPLE, header_style="bold")
+        alt.add_column("Add")
+        alt.add_column("Drop")
+        alt.add_column("Gain", justify="right")
+        for a in result["alternatives"]:
+            style = "green" if a["gain_ppw"] > 0 else "dim"
+            alt.add_row(who(a["add"]), who(a["drop"]), f"[{style}]{a['gain_ppw']:+.2f}/wk[/{style}]")
+        console.print(alt)
+    for note in result.get("notes", []):
+        console.print(f"[dim]• {note}[/dim]")
+    console.print("[dim]Gains = expected starting-lineup points per remaining week (projections, byes, injury tags, "
+                  "simulated availability). Check news before claiming: projections can lag injuries.[/dim]")
+
+
 TIER_STYLES = {"LIKELY": "bold green", "PLAUSIBLE": "yellow", "UNLIKELY": "red", "UNKNOWN": "dim"}
 
 
@@ -857,8 +1003,6 @@ def _split_names(text) -> list:
 
 def render_trade_eval(advisor: FantasyAdvisor, args):
     """Rest-of-season evaluation of one specific trade, from both sides."""
-    import json
-
     give, get = _split_names(args.give), _split_names(args.get)
     if not give or not get:
         console.print("[red]Provide both --give and --get (comma-separated player names).[/red]")
@@ -873,13 +1017,13 @@ def render_trade_eval(advisor: FantasyAdvisor, args):
                 )
     except ValueError as e:
         if args.json:
-            print(json.dumps({"error": str(e)}))
+            emit_json({"error": str(e)})
         else:
             console.print(f"[red]{e}[/red]")
         sys.exit(1)
 
     if args.json:
-        print(json.dumps(result, default=str, indent=2))
+        emit_json(result)
         return
 
     you, partner = result["you"], result["partner"]
@@ -1044,6 +1188,16 @@ def main():
     waivers_p.add_argument("--positions", type=str, default=None, help="Comma-separated positions: WR,RB,TE")
     waivers_p.add_argument("--league-id", type=str, default=None, help="Sleeper league ID to filter out owned players")
     waivers_p.add_argument("--limit", type=int, default=10, help="Max candidates to display")
+    waivers_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+
+    # Waiver moves command
+    wmoves_p = subparsers.add_parser(
+        "waiver-moves", help="Best free drop -> add moves by rest-of-season value and title odds"
+    )
+    wmoves_p.add_argument("--league-id", type=str, default=None, help="Sleeper league ID (defaults to saved)")
+    wmoves_p.add_argument("--username", type=str, default=None, help="Your Sleeper username (defaults to saved)")
+    wmoves_p.add_argument("--max-moves", type=int, default=3, help="Max drop -> add moves to recommend (default: 3)")
+    wmoves_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
 
     # Trades command
     trades_p = subparsers.add_parser("trades", help="Find buy-low and sell-high regression trade targets")
@@ -1051,6 +1205,7 @@ def main():
     trades_p.add_argument("--week", type=int, default=None, help="NFL Week number")
     trades_p.add_argument("--username", type=str, default=None, help="Your Sleeper username or user_id (defaults to saved)")
     trades_p.add_argument("--league-id", type=str, default=None, help="Sleeper league ID for bilateral trade proposals (defaults to saved)")
+    trades_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
 
     # Trade evaluation command
     teval_p = subparsers.add_parser(
@@ -1123,8 +1278,17 @@ def main():
         run_bot(token=args.token)
         return
 
-    advisor = FantasyAdvisor()
+    if getattr(args, "json", False):
+        # Keep stdout pure JSON: send library prints / progress to stderr
+        import contextlib
 
+        with contextlib.redirect_stdout(sys.stderr):
+            _dispatch(FantasyAdvisor(), args)
+        return
+    _dispatch(FantasyAdvisor(), args)
+
+
+def _dispatch(advisor: FantasyAdvisor, args) -> None:
     if args.command in ["connect", "config"]:
         render_connect(advisor, args)
     elif args.command == "leagues":
@@ -1137,6 +1301,8 @@ def main():
         render_waivers(advisor, args)
     elif args.command == "trades":
         render_trades(advisor, args)
+    elif args.command == "waiver-moves":
+        render_waiver_moves(advisor, args)
     elif args.command == "trade-eval":
         render_trade_eval(advisor, args)
     elif args.command == "trending":

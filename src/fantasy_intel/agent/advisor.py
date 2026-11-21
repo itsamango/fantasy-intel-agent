@@ -29,6 +29,7 @@ from fantasy_intel.analytics.standings import (
 )
 from fantasy_intel.analytics.ros_value import (
     LeagueShape,
+    plan_waiver_moves,
     title_leverage,
     find_trades,
     RosterState,
@@ -41,6 +42,9 @@ from fantasy_intel.analytics.ros_value import (
 from fantasy_intel.config import (
     DEFAULT_SEASON,
     MARKET_PLAUSIBLE_LINEUP_MIN,
+    MARKET_TRADEABLE_MIN_VALUE,
+    ROS_FA_CANDIDATES_PER_POS,
+    ROS_WAIVER_MAX_SWAPS,
     FPOE_HISTORY_SEASONS,
     ROS_SIMS,
     SCORING_PPR,
@@ -564,6 +568,7 @@ class FantasyAdvisor:
         username: Optional[str] = None,
         n_sims: int = ROS_SIMS,
         use_model_fallback: bool = True,
+        fa_per_position: int = ROS_FA_CANDIDATES_PER_POS,
     ) -> Dict[str, Any]:
         """Gathers everything the ROS valuator needs for one Sleeper league.
 
@@ -640,7 +645,7 @@ class FantasyAdvisor:
         outlooks = build_outlooks(
             candidate_ids, players_db, projections, teams_playing, shape.weeks, scoring, fallback_ppg=fallback
         )
-        free_agents = top_free_agents(outlooks, rostered)
+        free_agents = top_free_agents(outlooks, rostered, per_position=fa_per_position)
         notes.append(
             f"Weeks {shape.weeks[0]}-{shape.weeks[-1]} (playoffs {sorted(shape.playoff_weeks)}); "
             f"projections: Sleeper weekly, model proj_ppg fallback; {n_sims} availability simulations."
@@ -827,6 +832,49 @@ class FantasyAdvisor:
                 options = ", ".join(sorted(players_db[m].get("full_name", m) for m in matches))
                 raise ValueError(f"'{raw}' is ambiguous: {options}.")
         return out
+
+    def get_waiver_moves(
+        self,
+        league_id: Optional[str] = None,
+        username: Optional[str] = None,
+        max_moves: int = ROS_WAIVER_MAX_SWAPS,
+        n_sims: int = ROS_SIMS,
+        fa_per_position: int = 10,
+    ) -> Dict[str, Any]:
+        """The user's best free waiver moves by rest-of-season value and title odds."""
+        ctx = self.build_ros_context(
+            league_id=league_id, username=username, n_sims=n_sims, fa_per_position=fa_per_position
+        )
+        ui = ctx["user_index"]
+        result = plan_waiver_moves(
+            ctx["valuator"], ctx["rosters"][ui], ctx["free_agents"], season=ctx.get("season"), max_swaps=max_moves
+        )
+        lc = ctx.get("league_context") or {}
+        my_roster_id = ctx["roster_ids"][ui]
+        rec = next((r for r in lc.get("rosters") or [] if r.get("roster_id") == my_roster_id), {})
+        values = self._market_values(lc) if lc else {}
+        for item in [m for m in result["moves"]] + result["alternatives"]:
+            for side in ("add", "drop"):
+                c = item.get(side)
+                if c:
+                    mv = values.get(c["player_id"]) or {}
+                    c["market_value"] = round(mv["value"]) if mv else 0
+                    c["market_trend_30d"] = mv.get("trend_30d")
+                    if side == "drop":
+                        c["has_trade_value"] = c["market_value"] >= MARKET_TRADEABLE_MIN_VALUE
+        result.update({
+            "league_name": ctx["league_name"],
+            "scoring": ctx["scoring"],
+            "current_week": ctx["current_week"],
+            "waiver_type": "rolling priority" if lc.get("waiver_type") == 0 else "FAAB",
+            "faab_remaining": rec.get("faab_remaining") if isinstance(rec, dict) else None,
+            "faab_budget": lc.get("faab_budget"),
+            "notes": ctx["notes"] + [
+                f"Free-agent pool: top {fa_per_position} unrostered players per position by ROS projection. "
+                "Sleeper does not expose per-league waiver status, so some may need a claim.",
+            ],
+        })
+        return result
 
     def evaluate_trade(
         self,

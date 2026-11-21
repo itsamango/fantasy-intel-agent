@@ -123,6 +123,9 @@ MARKET_MIN_TOTAL_VALUE = 300.0
 # Judgment calls (e.g. Kyren Williams -40% in 30d -> counted at 80%).
 MARKET_FALLER_THRESHOLD = 0.25
 MARKET_FALLER_DISCOUNT = 0.5
+# Waiver-moves: a suggested drop with at least this FantasyCalc value still has
+# trade value; flag it so the user shops him before cutting.
+MARKET_TRADEABLE_MIN_VALUE = 500.0
 # Sweetener search: players whose value is within this multiple of the gap to close
 MARKET_SWEETENER_MAX_MULTIPLE = 2.5
 MARKET_SWEETENER_OPTIONS = 2
