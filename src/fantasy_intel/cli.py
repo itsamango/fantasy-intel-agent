@@ -218,6 +218,8 @@ def render_trades(advisor: FantasyAdvisor, args):
     cards = proposals_bundle.get("proposals") or []
     if not cards:
         console.print("[yellow]No mutually beneficial bilateral trade proposals found for this league.[/yellow]")
+        for note in proposals_bundle.get("notes") or []:
+            console.print(f"[dim]• {note}[/dim]")
         return
 
     def player_cell(card):
@@ -226,8 +228,9 @@ def render_trades(advisor: FantasyAdvisor, args):
             text += f", {card['tag']}"
         return text
 
+    ros_engine = proposals_bundle.get("engine") == "rest_of_season"
     trade_table = Table(
-        title="🤝 Personalized Bilateral Trade Proposals",
+        title="🤝 Bilateral Trade Proposals" + (" (rest-of-season lineup impact, pts/week)" if ros_engine else ""),
         box=box.ROUNDED,
         header_style="bold green",
     )
@@ -236,7 +239,12 @@ def render_trades(advisor: FantasyAdvisor, args):
     trade_table.add_column("Target", style="magenta")
     trade_table.add_column("Your Gain", justify="right", style="bold green")
     trade_table.add_column("Their Gain", justify="right", style="green")
-    trade_table.add_column("P(accept)", justify="right", style="bold yellow")
+    if ros_engine:
+        trade_table.add_column("Δ Title (you)", justify="right", style="bold")
+        trade_table.add_column("Market", justify="right")
+        trade_table.add_column("Likelihood", justify="center")
+    else:
+        trade_table.add_column("P(accept)", justify="right", style="bold yellow")
     trade_table.add_column("Pitch", style="dim")
 
     for c in cards:
@@ -244,13 +252,26 @@ def render_trades(advisor: FantasyAdvisor, args):
             " + ".join(player_cell(p) for p in c["send"]),
             " + ".join(player_cell(p) for p in c["receive"]),
             str(c["target_manager"]),
-            f"+{c['your_lineup_gain']:.1f}",
-            f"+{c['their_lineup_gain']:.1f}",
-            f"{c['p_accept'] * 100:.0f}%",
+            f"{c['your_lineup_gain']:+.2f}" if ros_engine else f"+{c['your_lineup_gain']:.1f}",
+            f"{c['their_lineup_gain']:+.2f}" if ros_engine else f"+{c['their_lineup_gain']:.1f}",
+            *(
+                [
+                    "—" if c.get("your_title_delta") is None else f"{c['your_title_delta'] * 100:+.1f} pts",
+                    "—" if c.get("market_delta") is None else f"{c['market_delta']:+.1%}",
+                    _tier_markup(c.get("market_tier")),
+                ]
+                if ros_engine
+                else [f"{c['p_accept'] * 100:.0f}%"]
+            ),
             str(c["pitch"]),
         )
 
     console.print(trade_table)
+    odds = proposals_bundle.get("current_odds")
+    if odds:
+        console.print(f"[bold]Your current odds:[/bold] playoffs {odds['playoffs']:.0%} · bye {odds['bye']:.0%} · title {odds['title']:.1%}")
+    for note in proposals_bundle.get("notes") or []:
+        console.print(f"[dim]• {note}[/dim]")
 
 
 def render_trending(advisor: FantasyAdvisor, args):
@@ -821,6 +842,197 @@ def render_drops(advisor: FantasyAdvisor, args):
     console.print(table)
 
 
+TIER_STYLES = {"LIKELY": "bold green", "PLAUSIBLE": "yellow", "UNLIKELY": "red", "UNKNOWN": "dim"}
+
+
+def _tier_markup(tier) -> str:
+    tier = tier or "UNKNOWN"
+    style = TIER_STYLES.get(tier, "dim")
+    return f"[{style}]{tier}[/{style}]"
+
+
+def _split_names(text) -> list:
+    return [n.strip() for n in (text or "").split(",") if n.strip()]
+
+
+def render_trade_eval(advisor: FantasyAdvisor, args):
+    """Rest-of-season evaluation of one specific trade, from both sides."""
+    import json
+
+    give, get = _split_names(args.give), _split_names(args.get)
+    if not give or not get:
+        console.print("[red]Provide both --give and --get (comma-separated player names).[/red]")
+        sys.exit(2)
+    try:
+        if args.json:
+            result = advisor.evaluate_trade(give, get, league_id=args.league_id, username=args.username, n_sims=args.sims)
+        else:
+            with console.status("[bold green]Simulating rest-of-season lineups for both teams..."):
+                result = advisor.evaluate_trade(
+                    give, get, league_id=args.league_id, username=args.username, n_sims=args.sims
+                )
+    except ValueError as e:
+        if args.json:
+            print(json.dumps({"error": str(e)}))
+        else:
+            console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps(result, default=str, indent=2))
+        return
+
+    you, partner = result["you"], result["partner"]
+    weeks = result["weeks"]
+    n_weeks = len(weeks)
+
+    def names(cards):
+        return ", ".join(f"{c['name']} ({c.get('position', '?')})" for c in cards)
+
+    color = {"HURTS YOU": "red", "FAVORS YOU": "green"}.get(result["verdict"], "green" if "WIN-WIN" in result["verdict"] else "yellow")
+    console.print(Panel(
+        f"[bold]You send:[/bold] {names(result['you_send'])}\n"
+        f"[bold]You get:[/bold]  {names(result['you_get'])}   [dim](from {result['partner_name']})[/dim]\n\n"
+        f"[bold {color}]{result['verdict']}[/bold {color}]  [dim](by {result.get('verdict_basis', 'lineup points')})[/dim]\n"
+        + (
+            "".join(
+                f"{label}: title {o['before']['title']:.1%} → [bold]{o['after']['title']:.1%}[/bold] "
+                f"({o['delta']['title'] * 100:+.1f} pts) · playoffs {o['before']['playoffs']:.0%} → {o['after']['playoffs']:.0%} "
+                f"· bye {o['before']['bye']:.0%} → {o['after']['bye']:.0%}\n"
+                for label, o in (("You", result["odds"]["you"]), (result["partner_name"], result["odds"]["partner"]))
+            )
+            if result.get("odds") else ""
+        )
+        + f"Lineup: you {you['delta_per_week']:+.2f} pts/wk, {result['partner_name']} {partner['delta_per_week']:+.2f} pts/wk",
+        title=f"🤝 Trade Evaluation · {result.get('league_name') or ''} · weeks {weeks[0]}–{weeks[-1]}",
+        box=box.ROUNDED,
+    ))
+
+    table = Table(title="Rest-of-season expected starting-lineup points", box=box.ROUNDED, header_style="bold cyan")
+    table.add_column("Team", style="bold white")
+    table.add_column("Before", justify="right")
+    table.add_column("After", justify="right")
+    table.add_column("Δ Total", justify="right", style="bold")
+    table.add_column(f"Δ Reg. season", justify="right")
+    table.add_column(f"Δ Playoffs {result['playoff_weeks'][0]}–{result['playoff_weeks'][-1]}" if result["playoff_weeks"] else "Δ Playoffs", justify="right")
+    table.add_column("Δ / week", justify="right")
+    table.add_column("Roster moves", style="dim")
+    for label, side in (("You", you), (result["partner_name"], partner)):
+        moves = []
+        if side["drops"]:
+            moves.append("drop " + ", ".join(side["drops"]))
+        if side["adds"]:
+            moves.append("add " + ", ".join(side["adds"]) + " (FA)")
+        style = "green" if side["delta_total"] > 0 else "red"
+        table.add_row(
+            label, f"{side['before_total']:.1f}", f"{side['after_total']:.1f}",
+            f"[{style}]{side['delta_total']:+.1f}[/{style}]",
+            f"{side['delta_regular']:+.1f}", f"{side['delta_playoffs']:+.1f}",
+            f"{side['delta_per_week']:+.2f}", "; ".join(moves) or "—",
+        )
+    console.print(table)
+
+    def move_text(m):
+        if m.get("drop_name"):
+            return f"drop {m['drop_name']} → add {m['add_name']} (+{m['gain_ppw']:.2f}/wk)"
+        return f"add {m['add_name']} (open roster spot)"
+
+    if you.get("waiver_moves") or partner.get("waiver_moves"):
+        lines = []
+        if you.get("waiver_moves"):
+            lines.append("[bold]You (do these regardless of the trade):[/bold]")
+            lines += [f"  • {move_text(m)}" for m in you["waiver_moves"]]
+        if partner.get("waiver_moves"):
+            lines.append(f"[dim]{result['partner_name']} (assumed in their baseline):[/dim]")
+            lines += [f"  [dim]• {move_text(m)}[/dim]" for m in partner["waiver_moves"]]
+        lines.append("[dim]The trade is measured against these waiver-optimized rosters, so it gets no credit for free pickups.[/dim]")
+        console.print(Panel("\n".join(lines), title="🆓 Free waiver moves (baseline)", box=box.ROUNDED))
+
+    def lineup_table(label, side):
+        lt = Table(title=f"{label}: typical lineup before → after (avg pts/wk)", box=box.SIMPLE, header_style="bold")
+        lt.add_column("Slot", style="dim")
+        lt.add_column("Before")
+        lt.add_column("After")
+        before, after = side["lineup_before"], side["lineup_after"]
+        rows = max(len(before["starters"]), len(after["starters"]))
+        fmt = lambda e: f"{e['name']} ({e['position']}) {e['ppw']:.1f}" if e else "—"
+        for i in range(rows):
+            b = before["starters"][i] if i < len(before["starters"]) else None
+            a = after["starters"][i] if i < len(after["starters"]) else None
+            changed = (b or {}).get("name") != (a or {}).get("name")
+            lt.add_row((b or a)["slot"], fmt(b), f"[bold]{fmt(a)}[/bold]" if changed else fmt(a))
+        top_bench = lambda side_l: ", ".join(f"{e['name']} {e['ppw']:.1f}" for e in side_l["bench"][:4]) or "—"
+        lt.add_row("BN (top)", f"[dim]{top_bench(before)}[/dim]", f"[dim]{top_bench(after)}[/dim]")
+        console.print(lt)
+
+    if you.get("lineup_before"):
+        lineup_table("You", you)
+        lineup_table(result["partner_name"], partner)
+
+    wk = Table(title="Week-by-week lineup change (expected pts)", box=box.SIMPLE, header_style="bold")
+    wk.add_column("Team")
+    for w in weeks:
+        wk.add_column(f"W{w}{'*' if w in result['playoff_weeks'] else ''}", justify="right")
+    for label, side in (("You", you), (result["partner_name"], partner)):
+        wk.add_row(label, *[f"{side['weekly_delta'][w]:+.1f}" for w in weeks])
+    lev = result.get("title_leverage")
+    if lev:
+        peak = max(lev.values()) or 1.0
+        wk.add_row("[dim]Week importance (you)[/dim]", *[f"[dim]{lev.get(w, 0) / peak:.2f}[/dim]" for w in weeks])
+    console.print(wk)
+    if lev:
+        console.print("[dim]Week importance = title-odds value of one point that week, relative to your most important week "
+                      "(from your standings and schedule).[/dim]")
+
+    players = Table(title="Players in the deal", box=box.SIMPLE, header_style="bold")
+    for col in ("Side", "Player", "Pos", "Team", "Status", "ROS exp. pts", "Market value", "Byes", "No projection"):
+        players.add_column(col)
+    for side, cards in (("send", result["you_send"]), ("get", result["you_get"])):
+        for c in cards:
+            players.add_row(
+                side, c["name"], c.get("position", ""), str(c.get("team") or ""), str(c.get("injury_status") or "—"),
+                f"{c.get('ros_expected_points', 0):.1f}",
+                f"{c['market_value']:,} (#{c['market_rank']})" if c.get("market_rank") else (f"{c.get('market_value', 0):,}" if "market_value" in c else "—"),
+                ",".join(map(str, c.get("byes") or [])) or "—",
+                ",".join(map(str, c.get("weeks_without_projection") or [])) or "—",
+            )
+    console.print(players)
+
+    market = result.get("market") or {}
+    if market:
+        lines = [f"[bold]Likelihood:[/bold] {_tier_markup(market.get('tier'))}   {market.get('summary', '')}"]
+        if market.get("gap_pct") is not None:
+            lines.append(
+                f"Market value: you send {market['send_value']:,} · you get {market['get_value']:,} "
+                f"[dim]({market.get('source', 'FantasyCalc')})[/dim]"
+            )
+        for f in market.get("fallers") or []:
+            lines.append(
+                f"[dim]📉 {f.get('name', f['player_id'])}: market value down {f['decline_30d']:.0%} in 30 days; "
+                f"counted at {f['perceived']:,} (listed {f['listed']:,}) since managers anchor on recent scoring.[/dim]"
+            )
+        for sw in market.get("sweeteners") or []:
+            lines.append(
+                f"💡 Add [bold]{sw['add_name']}[/bold] (value {sw['add_value']:,}) → {_tier_markup(sw['market']['tier'])}; "
+                f"you still {sw['your_ppw']:+.2f} pts/wk, they {sw['partner_ppw']:+.2f}"
+            )
+        for sk in market.get("sweeteners_skipped") or []:
+            lines.append(f"[dim]🚫 Not suggesting {sk['name']}: {sk['reason']}.[/dim]")
+        if market.get("tier") in ("PLAUSIBLE", "UNLIKELY") and not market.get("sweeteners") and market.get("value_to_add"):
+            lines.append(
+                f"[dim]Closing the market gap needs ~{market['value_to_add']:,} more value from you; "
+                "no single bench add does that while keeping the trade a win for you.[/dim]"
+            )
+        console.print(Panel("\n".join(lines), title="📈 Trade market (will they accept?)", box=box.ROUNDED))
+    deadline = result.get("trade_deadline")
+    if deadline and result.get("current_week") and int(result["current_week"]) >= int(deadline):
+        console.print(f"[bold yellow]⚠ League trade deadline is week {deadline} (current week {result['current_week']}).[/bold yellow]")
+    for note in result.get("notes", []):
+        console.print(f"[dim]• {note}[/dim]")
+    console.print("[dim]* playoff week. Values = expected points from your best available lineup each week "
+                  "(byes, injury tags, and random availability simulated); not trade-market value.[/dim]")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Fantasy Football Intelligence Agent CLI")
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
@@ -839,6 +1051,17 @@ def main():
     trades_p.add_argument("--week", type=int, default=None, help="NFL Week number")
     trades_p.add_argument("--username", type=str, default=None, help="Your Sleeper username or user_id (defaults to saved)")
     trades_p.add_argument("--league-id", type=str, default=None, help="Sleeper league ID for bilateral trade proposals (defaults to saved)")
+
+    # Trade evaluation command
+    teval_p = subparsers.add_parser(
+        "trade-eval", help="Evaluate a specific trade: rest-of-season lineup impact for you and your partner"
+    )
+    teval_p.add_argument("--give", type=str, required=True, help='Players you send, comma-separated (e.g. "Jonathan Taylor")')
+    teval_p.add_argument("--get", type=str, required=True, help='Players you receive, comma-separated (one opposing roster)')
+    teval_p.add_argument("--league-id", type=str, default=None, help="Sleeper league ID (defaults to saved)")
+    teval_p.add_argument("--username", type=str, default=None, help="Your Sleeper username (defaults to saved)")
+    teval_p.add_argument("--sims", type=int, default=300, help="Availability simulations (default: 300)")
+    teval_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
 
     # Trending command
     trending_p = subparsers.add_parser("trending", help="View Sleeper nationwide trending adds and drops")
@@ -914,6 +1137,8 @@ def main():
         render_waivers(advisor, args)
     elif args.command == "trades":
         render_trades(advisor, args)
+    elif args.command == "trade-eval":
+        render_trade_eval(advisor, args)
     elif args.command == "trending":
         render_trending(advisor, args)
     elif args.command == "news":
