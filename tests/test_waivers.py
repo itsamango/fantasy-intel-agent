@@ -488,3 +488,31 @@ def test_get_sleeper_season_data_emits_receiving_yards(monkeypatch):
     # rec_yd / rec_air_yd both flow through so racr / unrealized compute on the live path
     assert abs(out["racr"] - 70.0 / 40.0) < 1e-9
     assert out["unrealized_air_yards"] == 0.0
+
+
+def test_ensure_engines_prefers_sleeper_weekly_for_current_season():
+    weekly_row = _sleeper_frame_row(pid="7", name="Weekly Wr")
+    sleeper_weekly = pd.DataFrame([weekly_row])
+    sleeper_weekly.attrs["data_through_week"] = 6
+
+    class _WeeklyLoader(_PathStubLoader):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.weekly_sleeper_calls = []
+
+        def get_sleeper_weekly_data(self, season=2026):
+            self.weekly_sleeper_calls.append(season)
+            return sleeper_weekly
+
+    row = _skill_row("00-0000001", "Alpha WR", "WR", 6, 0.9, 8, 0, 0.26, 0.30, 100, 30, 10)
+    row["season"] = 2026
+    loader = _WeeklyLoader(weekly_frame=pd.DataFrame([row]), sleeper_frame=pd.DataFrame([_sleeper_frame_row()]))
+    advisor = FantasyAdvisor(data_loader=loader, sleeper_client=_StubSleeper(_league()))
+
+    advisor._ensure_engines([2026])
+
+    # current season first, then the two prior seasons as FPOE-baseline history
+    assert loader.weekly_sleeper_calls == [2026, 2024, 2025]
+    assert loader.weekly_calls == [] and loader.sleeper_calls == []
+    assert advisor._waiver_engine.df["player_display_name"].tolist() == ["Weekly Wr"]
+    assert advisor.data_through_week == 6

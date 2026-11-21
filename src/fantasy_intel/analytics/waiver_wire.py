@@ -17,11 +17,16 @@ from fantasy_intel.config import (
 class WaiverWireEngine:
     """Detects under-the-radar waiver pickups using leading volume metrics."""
 
-    def __init__(self, weekly_df: pd.DataFrame, scoring: str = SCORING_PPR):
+    def __init__(
+        self,
+        weekly_df: pd.DataFrame,
+        scoring: str = SCORING_PPR,
+        fpoe_history: Optional[pd.DataFrame] = None,
+    ):
         self.raw_df = weekly_df
-        # Enrich dataset
+        # Enrich dataset (fpoe_history seeds each player's efficiency baseline)
         traj = compute_player_trajectories(weekly_df)
-        self.df = estimate_expected_fantasy_points(traj, scoring=scoring)
+        self.df = estimate_expected_fantasy_points(traj, scoring=scoring, fpoe_history=fpoe_history)
 
     def scan_sleepers(
         self,
@@ -175,13 +180,14 @@ class WaiverWireEngine:
                 cat = "IR_STASH_ONLY"
                 note = f"STASH ASSET: Ruled {own_inj}. Eligible for open IR slot."
             elif tier == "ELEVATED_STARTER":
-                # High-priority vacancy
-                adj_score = min(80.0, round(base_opp + 15.0, 1))
+                # V2 fix: never cap below base_opp; a high-usage handcuff with
+                # base_opp=85 was previously downgraded to 80.0 by the old min().
+                adj_score = min(100.0, max(base_opp, round(base_opp + 15.0, 1)))
                 cat = "HIGH_PRIORITY_ADD"
                 note = f"IMMEDIATE STARTER: {summary}"
             elif tier == "POTENTIAL_SURGE":
                 # Starters Questionable
-                adj_score = min(70.0, round(base_opp + 8.0, 1))
+                adj_score = min(95.0, max(base_opp, round(base_opp + 8.0, 1)))
                 cat = "CONTINGENCY_ADD"
                 note = f"SURGE CANDIDATE: {summary}"
             else:
@@ -214,6 +220,8 @@ class WaiverWireEngine:
             "racr",
             "unrealized_air_yards",
             "rolling_xfp_3w",
+            "proj_ppg",
+            "fpoe_eff",
             "fantasy_points_ppr",
             "expected_fp_ppr",
             "base_opportunity_index",
@@ -340,16 +348,28 @@ def recommend_faab_bids(
     except (TypeError, ValueError):
         waiver_position = None
 
+    # Value = skill-adjusted projection (proj_ppg) when supplied, else rolling xFP.
+    # Candidates and roster must use the same scale.
+    def _value_col(frame: Optional[pd.DataFrame]) -> str:
+        if frame is not None and "proj_ppg" in frame.columns and frame["proj_ppg"].notna().any():
+            return "proj_ppg"
+        return "rolling_xfp_3w"
+
+    roster_value_col = _value_col(user_roster)
+    cand_value_col = _value_col(out)
+    if roster_value_col != cand_value_col:
+        roster_value_col = cand_value_col = "rolling_xfp_3w"
+
     # Replacement baseline: the user's worst rostered player at each position
     baselines: Dict[str, float] = {}
     if (
         user_roster is not None
         and not user_roster.empty
-        and {"position", "rolling_xfp_3w"}.issubset(user_roster.columns)
+        and {"position", roster_value_col}.issubset(user_roster.columns)
     ):
         by_pos = (
-            user_roster.dropna(subset=["rolling_xfp_3w"])
-            .groupby("position")["rolling_xfp_3w"]
+            user_roster.dropna(subset=[roster_value_col])
+            .groupby("position")[roster_value_col]
             .min()
         )
         baselines = by_pos.to_dict()
@@ -368,8 +388,8 @@ def recommend_faab_bids(
         injured_starter_positions = {p for p in hurt["position"].dropna()}
 
     positions = out["position"] if "position" in out.columns else pd.Series("", index=out.index)
-    if "rolling_xfp_3w" in out.columns:
-        cand_xfp = pd.to_numeric(out["rolling_xfp_3w"], errors="coerce").fillna(0.0)
+    if cand_value_col in out.columns:
+        cand_xfp = pd.to_numeric(out[cand_value_col], errors="coerce").fillna(0.0)
     else:
         cand_xfp = pd.Series(0.0, index=out.index)
     if "opportunity_index" in out.columns:

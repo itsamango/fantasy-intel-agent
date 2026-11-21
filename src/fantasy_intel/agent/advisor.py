@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+import numpy as np
 import pandas as pd
 
 from fantasy_intel.data.loader import DataLoader
@@ -10,10 +11,41 @@ from fantasy_intel.data.sleeper import SleeperClient
 from fantasy_intel.data.weather import get_game_wind_forecast
 from fantasy_intel.analytics.metrics import _normalize_ids, add_projection_distributions, attach_pbp_features
 from fantasy_intel.analytics.waiver_wire import WaiverWireEngine, recommend_faab_bids
-from fantasy_intel.analytics.trades import TradeAnalyzer, generate_league_trade_proposals
+from fantasy_intel.analytics.trades import (
+    BUY_LOW_MAX_ROLLING_FPOE,
+    SELL_HIGH_MIN_ROLLING_FPOE,
+    TradeAnalyzer,
+    generate_league_trade_proposals,
+)
 from fantasy_intel.analytics.depth_chart import DepthChartManager
 from fantasy_intel.analytics.matchups import MatchupAdvisor, compute_defensive_epa_rates
-from fantasy_intel.config import DEFAULT_SEASON, SCORING_PPR, load_user_config
+from fantasy_intel.analytics.market import TIER_ORDER, assess_trade, find_sweeteners, is_faller, market_decline
+from fantasy_intel.data.fantasycalc import FantasyCalcClient, market_params_from_league
+from fantasy_intel.analytics.standings import (
+    SeasonSimulator,
+    SeasonState,
+    estimate_weekly_sd,
+    playoff_round_weeks,
+)
+from fantasy_intel.analytics.ros_value import (
+    LeagueShape,
+    title_leverage,
+    find_trades,
+    RosterState,
+    RosValuator,
+    build_outlooks,
+    evaluate_trade,
+    teams_playing_from_schedule,
+    top_free_agents,
+)
+from fantasy_intel.config import (
+    DEFAULT_SEASON,
+    MARKET_PLAUSIBLE_LINEUP_MIN,
+    FPOE_HISTORY_SEASONS,
+    ROS_SIMS,
+    SCORING_PPR,
+    load_user_config,
+)
 from fantasy_intel.news.scraper import NewsCollector
 from fantasy_intel.news.parser import NewsContextParser
 
@@ -36,6 +68,10 @@ class FantasyAdvisor:
         self._trade_analyzer: Optional[TradeAnalyzer] = None
         self._loaded_seasons: List[int] = []
         self._loaded_scoring: Optional[str] = None
+        self.data_through_week: Optional[int] = None
+        self._fpoe_history_cache: Dict[int, Optional[pd.DataFrame]] = {}
+        self.market = FantasyCalcClient()
+        self._market_cache: Dict[Any, Dict[str, Dict[str, Any]]] = {}
 
     def _ensure_engines(self, seasons: List[int], scoring: str = SCORING_PPR):
         if (
@@ -43,27 +79,74 @@ class FantasyAdvisor:
             or self._loaded_seasons != seasons
             or self._loaded_scoring != scoring
         ):
-            season = seasons[0] if seasons else 2026
+            season = seasons[0] if seasons else DEFAULT_SEASON
+            attached_seasons = [season] if season >= 2025 else list(seasons)
             if season >= 2025:
-                attached_seasons = [season]
-                dataset = self._nflverse_weekly_if_available(season)
+                # Source order for current seasons:
+                # 1. Sleeper per-week stats (live, real weekly rows, Sleeper ids)
+                # 2. nflverse weekly (if ever published again for this season)
+                # 3. Sleeper season aggregate (one row per player; last resort)
+                dataset = self._sleeper_weekly_if_available(season)
                 if dataset is None:
+                    dataset = self._nflverse_weekly_if_available(season)
+                if dataset is None:
+                    logger.warning(
+                        f"No weekly data for {season}; falling back to Sleeper season totals "
+                        "(rolling/trend metrics degrade to season averages)."
+                    )
                     dataset = self.loader.get_sleeper_season_data(season=season)
-                if dataset.empty:
-                    dataset = self.loader.get_weekly_with_snaps(seasons=[DEFAULT_SEASON])
-                    attached_seasons = [DEFAULT_SEASON]
             else:
                 dataset = self.loader.get_weekly_with_snaps(seasons=seasons)
-                attached_seasons = list(seasons)
+            self.data_through_week = (
+                dataset.attrs.get("data_through_week")
+                if dataset is not None
+                else None
+            )
 
             # Enrich with PBP opportunity features so trajectories carry
             # hvt / unrealized_air_yards / situational xFP (rolling_xfp_3w)
             dataset = attach_pbp_features(dataset, self.loader, seasons=attached_seasons)
 
-            self._waiver_engine = WaiverWireEngine(dataset, scoring=scoring)
-            self._trade_analyzer = TradeAnalyzer(dataset)
+            # Prior seasons seed each player's FPOE efficiency baseline
+            history = self._fpoe_history(season) if season >= 2025 else None
+
+            self._waiver_engine = WaiverWireEngine(dataset, scoring=scoring, fpoe_history=history)
+            self._trade_analyzer = TradeAnalyzer(dataset, scoring=scoring, fpoe_history=history)
             self._loaded_seasons = seasons
             self._loaded_scoring = scoring
+
+    def _fpoe_history(self, season: int) -> Optional[pd.DataFrame]:
+        """Prior seasons' Sleeper weekly frames (pbp-enriched) for the FPOE baseline, cached per season."""
+        if season in self._fpoe_history_cache:
+            return self._fpoe_history_cache[season]
+        frames = []
+        for prior in range(season - FPOE_HISTORY_SEASONS, season):
+            weekly = self._sleeper_weekly_if_available(prior)
+            if weekly is None:
+                logger.info(f"No {prior} weekly history for the FPOE baseline.")
+                continue
+            try:
+                frames.append(attach_pbp_features(weekly, self.loader, seasons=[prior]))
+            except Exception as e:
+                logger.warning(f"PBP enrichment failed for {prior} history ({e}); using box-score xFP.")
+                frames.append(weekly)
+        history = pd.concat(frames, ignore_index=True) if frames else None
+        self._fpoe_history_cache[season] = history
+        return history
+
+    def _sleeper_weekly_if_available(self, season: int) -> Optional[pd.DataFrame]:
+        """Sleeper per-week stat frame for the season, else None."""
+        fetch = getattr(self.loader, "get_sleeper_weekly_data", None)
+        if fetch is None:
+            return None
+        try:
+            weekly = fetch(season=season)
+        except Exception as e:
+            logger.warning(f"Sleeper weekly stats unavailable for season {season}: {e}")
+            return None
+        if weekly is None or weekly.empty or not (weekly["season"] == season).any():
+            return None
+        return weekly
 
     def _nflverse_weekly_if_available(self, season: int) -> Optional[pd.DataFrame]:
         """nflverse weekly frame for the season when published, else None.
@@ -102,13 +185,13 @@ class FantasyAdvisor:
             return normalized
         return normalized.map(gsis_to_sleeper)
 
-    def _latest_sleeper_xfp(self) -> Dict[str, float]:
-        """Latest-week rolling 3-week xFP per player, keyed by Sleeper id."""
+    def _latest_sleeper_xfp(self, col: str = "rolling_xfp_3w") -> Dict[str, float]:
+        """Latest-week value of `col` (rolling 3-week xFP by default) per player, keyed by Sleeper id."""
         df = self._waiver_engine.df
         if (
             df is None
             or df.empty
-            or "rolling_xfp_3w" not in df.columns
+            or col not in df.columns
             or "week" not in df.columns
         ):
             return {}
@@ -118,7 +201,7 @@ class FantasyAdvisor:
         sleeper_ids = self._resolve_sleeper_ids(latest[key])
         return {
             str(sid): float(xfp)
-            for sid, xfp in zip(sleeper_ids, latest["rolling_xfp_3w"])
+            for sid, xfp in zip(sleeper_ids, latest[col])
             if sid is not None and pd.notna(xfp)
         }
 
@@ -130,6 +213,7 @@ class FantasyAdvisor:
         """Builds the user-roster frame consumed by recommend_faab_bids."""
         starter_ids = {str(p) for p in (user_roster_record.get("starters") or []) if p}
         xfp_by_sleeper_id = self._latest_sleeper_xfp()
+        proj_by_sleeper_id = self._latest_sleeper_xfp("proj_ppg")
 
         rows = []
         for pid in (user_roster_record.get("players") or []):
@@ -140,6 +224,7 @@ class FantasyAdvisor:
                 "player_display_name": p.get("full_name") or f"Player {pid}",
                 "position": p.get("position"),
                 "rolling_xfp_3w": xfp_by_sleeper_id.get(pid),
+                "proj_ppg": proj_by_sleeper_id.get(pid),
                 "is_starter": pid in starter_ids,
                 "injury_status": p.get("injury_status"),
                 "owner_id": user_roster_record.get("owner_id"),
@@ -180,7 +265,7 @@ class FantasyAdvisor:
 
     def get_waiver_sleepers(
         self,
-        season: int = 2024,
+        season: int = DEFAULT_SEASON,
         week: Optional[int] = None,
         positions: Optional[List[str]] = None,
         league_id: Optional[str] = None,
@@ -262,7 +347,7 @@ class FantasyAdvisor:
 
     def get_trade_recommendations(
         self,
-        season: int = 2024,
+        season: int = DEFAULT_SEASON,
         week: Optional[int] = None,
         positions: Optional[List[str]] = None,
         league_id: Optional[str] = None,
@@ -292,14 +377,125 @@ class FantasyAdvisor:
         if not username:
             username = load_user_config().get("sleeper_username")
         if username:
-            proposals = self._bilateral_trade_proposals(
-                league_id=league_id,
-                league_context=league_context,
-                username=username,
-            )
+            proposals = self._ros_trade_proposals(league_id=league_id, username=username)
+            if proposals is None:
+                # Fallback: legacy one-week lineup engine
+                proposals = self._bilateral_trade_proposals(
+                    league_id=league_id,
+                    league_context=league_context,
+                    username=username,
+                )
             if proposals is not None:
                 result["trade_proposals"] = proposals
         return result
+
+    def _ros_trade_proposals(
+        self, league_id: Optional[str], username: str, limit: int = 10, n_sims: int = ROS_SIMS
+    ) -> Optional[Dict[str, Any]]:
+        """Bilateral proposals scored on rest-of-season lineup impact for both teams."""
+        try:
+            ctx = self.build_ros_context(league_id=league_id, username=username, n_sims=n_sims)
+        except Exception as e:
+            logger.warning(f"ROS trade context unavailable ({e}); using legacy trade engine.")
+            return None
+        market_values = self._market_values(ctx["league_context"])
+        found = find_trades(
+            ctx["valuator"], ctx["rosters"], ctx["user_index"], ctx["free_agents"],
+            manager_names=ctx["manager_names"], roster_ids=ctx["roster_ids"], limit=limit,
+            market_values=market_values or None,
+            min_partner_market_pct=MARKET_PLAUSIBLE_LINEUP_MIN,
+            season=ctx.get("season"),
+        )
+        excess = self._latest_sleeper_xfp("fpoe_excess_3w") if self._waiver_engine is not None else {}
+        market_values = market_values or {}
+
+        def card(c: Dict[str, Any], receiving: bool = False) -> Dict[str, Any]:
+            pid = str(c.get("player_id"))
+            e = excess.get(pid)
+            tags = []
+            if e is not None and e >= SELL_HIGH_MIN_ROLLING_FPOE:
+                tags.append(f"running hot {e:+.1f}/gm")
+            elif e is not None and e <= BUY_LOW_MAX_ROLLING_FPOE:
+                tags.append(f"running cold {e:+.1f}/gm")
+            if receiving and is_faller(market_values, pid):
+                tags.append(f"market {-market_decline(market_values, pid):+.0%} in 30d: buy-low window")
+            return {**c, "tag": "; ".join(tags) or None}
+
+        proposals = []
+        for r in found["proposals"]:
+            give_ids = [c["player_id"] for c in r["you_send"]]
+            get_ids = [c["player_id"] for c in r["you_get"]]
+            r = self._attach_market(ctx, r, give_ids, get_ids, r["target_index"])
+            you, them = r["you"], r["partner"]
+            pitch = []
+            if r.get("odds"):
+                o = r["odds"]["you"]
+                pitch.append(
+                    f"title odds {o['before']['title']:.1%} → {o['after']['title']:.1%}, "
+                    f"playoffs {o['before']['playoffs']:.0%} → {o['after']['playoffs']:.0%}"
+                )
+            pitch.append(
+                f"ROS: you {you['delta_per_week']:+.2f}/wk ({you['delta_playoffs']:+.1f} in playoffs), "
+                f"them {them['delta_per_week']:+.2f}/wk"
+            )
+            if them["drops"]:
+                pitch.append(f"they cut {', '.join(them['drops'])}")
+            if you["drops"]:
+                pitch.append(f"you cut {', '.join(you['drops'])}")
+            if you["adds"]:
+                pitch.append(f"you add {', '.join(you['adds'])} off waivers")
+            market = r.get("market") or {}
+            if market.get("summary"):
+                pitch.append(market["summary"])
+            for sw in market.get("sweeteners") or []:
+                pitch.append(
+                    f"to make it {sw['market']['tier'].lower()}: add {sw['add_name']} "
+                    f"(you still {sw['your_ppw']:+.2f}/wk)"
+                )
+            proposals.append({
+                "target_manager": r["target_manager"],
+                "target_roster_id": r["target_roster_id"],
+                "send": [card(c) for c in r["you_send"]],
+                "receive": [card(c, receiving=True) for c in r["you_get"]],
+                "your_lineup_gain": you["delta_per_week"],
+                "their_lineup_gain": them["delta_per_week"],
+                "your_playoff_gain": you["delta_playoffs"],
+                "your_title_delta": (r.get("odds") or {}).get("you", {}).get("delta", {}).get("title"),
+                "their_title_delta": (r.get("odds") or {}).get("partner", {}).get("delta", {}).get("title"),
+                "market_delta": market.get("gap_pct"),
+                "market_tier": market.get("tier", "UNKNOWN"),
+                "market_send_value": market.get("send_value"),
+                "market_get_value": market.get("get_value"),
+                "sweeteners": market.get("sweeteners") or [],
+                "need_filled": None,
+                "p_accept": None,
+                "pitch": "; ".join(pitch),
+                "ros": r,
+            })
+        proposals.sort(key=lambda p: (
+            TIER_ORDER.get(p["market_tier"], 9),
+            -(p["your_title_delta"] if p["your_title_delta"] is not None else p["your_lineup_gain"]),
+        ))
+        notes = list(ctx["notes"]) + [
+            f"Screened {found['swaps_screened']} swaps (1-for-1, 2-for-1, 1-for-2); "
+            f"{found.get('market_rejected', 0)} dropped as market-lopsided against the partner "
+            f"(> {abs(MARKET_PLAUSIBLE_LINEUP_MIN):.0%} of value); "
+            f"{found['passed_screen']} passed the fast screen; top {found['rescored']} re-scored with "
+            "simulated availability and roster limits.",
+            "Gains are expected starting-lineup points per remaining week; partner must not lose lineup value.",
+            "Likelihood = FantasyCalc market fairness for the partner + their lineup change "
+            "(LIKELY: they lose <= 2.5% market value and their lineup holds; untrained tiers - tune from experience).",
+        ]
+        deadline = ctx.get("trade_deadline")
+        if deadline and int(ctx["current_week"]) >= int(deadline):
+            notes.insert(0, f"League trade deadline: week {deadline} (current week {ctx['current_week']}).")
+        return {
+            "proposals": proposals,
+            "current_odds": ctx.get("current_odds"),
+            "engine": "rest_of_season",
+            "league": {"name": ctx["league_name"], "scoring_type": ctx["scoring"]},
+            "notes": notes,
+        }
 
     def _bilateral_trade_proposals(
         self,
@@ -359,6 +555,320 @@ class FantasyAdvisor:
             logger.warning(f"Bilateral trade evaluation failed: {e}")
             return None
 
+    # ------------------------------------------------------------------ #
+    # Rest-of-season trade evaluation
+    # ------------------------------------------------------------------ #
+    def build_ros_context(
+        self,
+        league_id: Optional[str] = None,
+        username: Optional[str] = None,
+        n_sims: int = ROS_SIMS,
+        use_model_fallback: bool = True,
+    ) -> Dict[str, Any]:
+        """Gathers everything the ROS valuator needs for one Sleeper league.
+
+        Returns {"valuator", "rosters" (RosterState per team), "roster_ids",
+        "manager_names", "user_index", "free_agents", "players_db", "scoring",
+        "shape", "notes"}. Raises ValueError with a readable reason when the
+        league / user / remaining schedule cannot be resolved.
+        """
+        cfg = load_user_config()
+        league_id = league_id or cfg.get("default_league_id")
+        username = username or cfg.get("sleeper_username")
+        if not league_id or not username:
+            raise ValueError("Need a Sleeper league id and username (run `fantasy-intel connect`).")
+
+        info = self.sleeper.get_league_info(league_id) or {}
+        if not info:
+            raise ValueError(f"Could not load Sleeper league {league_id}.")
+        league_context = self.sleeper.get_league_context(league_id) or {}
+        scoring = league_context.get("scoring_type") or SCORING_PPR
+        season = int(info.get("season") or DEFAULT_SEASON)
+
+        state = self.sleeper.get_nfl_state() or {}
+        start_week = int(state.get("week") or 1)
+        if str(state.get("season") or season) != str(season):
+            raise ValueError(f"League season {season} is not the current NFL season.")
+        shape = LeagueShape.from_sleeper(info.get("roster_positions") or [], info.get("settings") or {}, start_week)
+        if not shape.weeks:
+            raise ValueError("No fantasy weeks remain this season.")
+
+        user = self.sleeper.get_user(username) or {}
+        user_id = str(user.get("user_id") or username)
+        raw_rosters = self.sleeper.get_league_rosters(league_id) or []
+        user_index = next((i for i, r in enumerate(raw_rosters) if str(r.get("owner_id")) == user_id), None)
+        if user_index is None:
+            raise ValueError(f"{username} has no roster in league {league_id}.")
+        users = self.sleeper.get_league_users(league_id) or []
+        display = {
+            u.get("user_id"): (u.get("metadata") or {}).get("team_name") or u.get("display_name")
+            for u in users
+        }
+
+        players_db = self.sleeper.get_all_players() or {}
+        rosters: List[RosterState] = []
+        rostered: Set[str] = set()
+        for r in raw_rosters:
+            reserve = [str(p) for p in (r.get("reserve") or [])]
+            active = [str(p) for p in (r.get("players") or []) if str(p) not in set(reserve)]
+            rosters.append(RosterState(active=active, reserve=reserve))
+            rostered.update(active + reserve)
+
+        notes: List[str] = []
+        projections = {w: self.sleeper.get_week_projections(season=season, week=w) or {} for w in shape.weeks}
+        try:
+            schedule = self.loader.get_schedules([season])
+        except Exception as e:
+            schedule = None
+            notes.append(f"Schedule unavailable ({e}); byes not modeled.")
+        teams_playing = teams_playing_from_schedule(schedule, shape.weeks)
+
+        fallback: Dict[str, float] = {}
+        if use_model_fallback:
+            try:
+                self._ensure_engines([season], scoring=scoring)
+                fallback = self._latest_sleeper_xfp("proj_ppg")
+            except Exception as e:
+                notes.append(f"Model projections unavailable for unprojected players ({e}).")
+
+        skill_ids = {
+            pid for pid, p in players_db.items()
+            if p.get("position") in ("QB", "RB", "WR", "TE") and (pid in rostered or p.get("team"))
+        }
+        projected = {pid for wk in projections.values() for pid in wk}
+        candidate_ids = (skill_ids & (rostered | projected | set(fallback)))
+        outlooks = build_outlooks(
+            candidate_ids, players_db, projections, teams_playing, shape.weeks, scoring, fallback_ppg=fallback
+        )
+        free_agents = top_free_agents(outlooks, rostered)
+        notes.append(
+            f"Weeks {shape.weeks[0]}-{shape.weeks[-1]} (playoffs {sorted(shape.playoff_weeks)}); "
+            f"projections: Sleeper weekly, model proj_ppg fallback; {n_sims} availability simulations."
+        )
+        valuator = RosValuator(shape, outlooks, n_sims=n_sims)
+        season_ctx = None
+        current_odds = None
+        try:
+            season_ctx = self._build_season(league_id, info, raw_rosters, rosters, valuator, user_index)
+            current_odds = season_ctx["sim"].run(season_ctx["base_means"]).for_team(user_index)
+            notes.append(
+                f"Standings-aware: {season_ctx['sim'].n_sims} season simulations (schedule, records, "
+                f"weekly SD {season_ctx['sim'].state.weekly_sd:.1f} from this league's scores); "
+                "verdicts use change in title odds."
+            )
+        except Exception as e:
+            logger.warning(f"Season simulation unavailable: {e}")
+            notes.append(f"Standings simulation unavailable ({e}); verdicts use lineup points.")
+        return {
+            "valuator": valuator,
+            "season": season_ctx,
+            "current_odds": current_odds,
+            "rosters": rosters,
+            "roster_ids": [r.get("roster_id") for r in raw_rosters],
+            "manager_names": [
+                display.get(r.get("owner_id")) or f"Roster {r.get('roster_id')}" for r in raw_rosters
+            ],
+            "user_index": user_index,
+            "free_agents": free_agents,
+            "players_db": players_db,
+            "scoring": scoring,
+            "shape": shape,
+            "league_name": info.get("name"),
+            "league_context": league_context,
+            "trade_deadline": (info.get("settings") or {}).get("trade_deadline"),
+            "current_week": start_week,
+            "notes": notes,
+        }
+
+    def _build_season(
+        self,
+        league_id: str,
+        info: Mapping[str, Any],
+        raw_rosters: Sequence[Mapping[str, Any]],
+        rosters: Sequence[RosterState],
+        valuator: RosValuator,
+        user_index: int,
+    ) -> Dict[str, Any]:
+        """SeasonSimulator inputs from Sleeper: records, remaining schedule, weekly SD, team strength."""
+        settings = info.get("settings") or {}
+        playoff_start = int(settings.get("playoff_week_start") or 15)
+        weeks = valuator.shape.weeks
+        regular = [w for w in weeks if w < playoff_start]
+        rounds = [[w for w in r if w in weeks] or r for r in playoff_round_weeks(settings)]
+        idx = {r.get("roster_id"): i for i, r in enumerate(raw_rosters)}
+
+        schedule: Dict[int, List[Tuple[int, int]]] = {}
+        for w in regular:
+            groups: Dict[Any, List[int]] = {}
+            for m in self.sleeper.get_matchups(league_id, w) or []:
+                if m.get("matchup_id") is not None and m.get("roster_id") in idx:
+                    groups.setdefault(m["matchup_id"], []).append(idx[m["roster_id"]])
+            schedule[w] = [tuple(g) for g in groups.values() if len(g) == 2]
+
+        first = weeks[0] if weeks else playoff_start
+        scores: Dict[Any, List[float]] = {}
+        for w in range(max(1, first - 8), first):
+            for m in self.sleeper.get_matchups(league_id, w) or []:
+                if m.get("points"):
+                    scores.setdefault(m.get("roster_id"), []).append(float(m["points"]))
+
+        def num(st: Mapping[str, Any], k: str) -> float:
+            return float(st.get(k) or 0)
+
+        wins = np.array([num(r.get("settings") or {}, "wins") + 0.5 * num(r.get("settings") or {}, "ties") for r in raw_rosters])
+        pf = np.array([num(r.get("settings") or {}, "fpts") + num(r.get("settings") or {}, "fpts_decimal") / 100 for r in raw_rosters])
+        state = SeasonState(
+            team_keys=[r.get("roster_id") for r in raw_rosters],
+            wins=wins,
+            points_for=pf,
+            schedule=schedule,
+            regular_weeks=regular,
+            playoff_rounds=rounds,
+            playoff_teams=int(settings.get("playoff_teams") or 6),
+            weekly_sd=estimate_weekly_sd(scores),
+            median_game=int(settings.get("league_average_match") or 0) == 1,
+        )
+        sim = SeasonSimulator(state)
+        base = np.zeros((len(rosters), len(state.weeks)))
+        for i, r in enumerate(rosters):
+            per_week = valuator.team_value(r.all_ids(), "sim").per_week
+            fill = float(np.mean(list(per_week.values()))) if per_week else 0.0
+            base[i] = [per_week.get(w, fill) for w in state.weeks]
+        return {"sim": sim, "base_means": base, "user_index": user_index}
+
+    def _market_values(self, league_context: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
+        """FantasyCalc redraft values for this league's settings ({} when unavailable)."""
+        params = market_params_from_league(league_context)
+        key = (params["numQbs"], params["numTeams"], params["ppr"])
+        if key not in self._market_cache:
+            self._market_cache[key] = self.market.get_values(
+                num_qbs=params["numQbs"], num_teams=params["numTeams"], ppr=params["ppr"]
+            )
+        return self._market_cache[key]
+
+    def _attach_market(
+        self,
+        ctx: Dict[str, Any],
+        result: Dict[str, Any],
+        give_ids: Sequence[str],
+        get_ids: Sequence[str],
+        partner_index: int,
+        find_sweeteners_if_needed: bool = True,
+    ) -> Dict[str, Any]:
+        """Adds market fairness, acceptance tier, per-player market values, and sweeteners."""
+        values = self._market_values(ctx["league_context"])
+        if not values:
+            result["market"] = {"tier": "UNKNOWN", "summary": "FantasyCalc values unavailable.", "sweeteners": []}
+            return result
+        params = market_params_from_league(ctx["league_context"])
+        market = assess_trade(values, give_ids, get_ids, result["partner"]["delta_per_week"])
+        market["source"] = (
+            f"FantasyCalc redraft ({params['numQbs']}QB, {params['numTeams']} teams, {params['ppr']:g} PPR)"
+        )
+        market["sweeteners"] = []
+        if find_sweeteners_if_needed and market["tier"] in ("PLAUSIBLE", "UNLIKELY") and market["value_to_add"] > 0:
+            ui = ctx["user_index"]
+            rosters = ctx["rosters"]
+            names = {pid: o.name for pid, o in ctx["valuator"].outlooks.items()}
+            excess = self._latest_sleeper_xfp("fpoe_excess_3w") if self._waiver_engine is not None else {}
+            cold = {
+                pid: f"running cold ({e:+.1f}/gm vs his own baseline): a buy-low, don't sell"
+                for pid, e in excess.items()
+                if e is not None and e <= BUY_LOW_MAX_ROLLING_FPOE
+            }
+            skipped: List[Dict[str, Any]] = []
+            market["sweeteners"] = find_sweeteners(
+                values,
+                rosters[ui].all_ids(),
+                give_ids,
+                get_ids,
+                market["value_to_add"],
+                evaluate=lambda send: evaluate_trade(
+                    ctx["valuator"], rosters[ui], rosters[partner_index], send, list(get_ids),
+                    ctx["free_agents"], mode="sim",
+                ),
+                names=names,
+                exclude=cold,
+                skipped=skipped,
+            )
+            market["sweeteners_skipped"] = skipped
+        for card in result.get("you_send", []) + result.get("you_get", []):
+            mv = values.get(str(card.get("player_id"))) or {}
+            card["market_value"] = round(mv["value"]) if mv else 0
+            card["market_rank"] = mv.get("overall_rank")
+            card["market_trend_30d"] = mv.get("trend_30d")
+        names_all = {pid: o.name for pid, o in ctx["valuator"].outlooks.items()}
+        for f in market.get("fallers") or []:
+            f["name"] = names_all.get(f["player_id"], f["player_id"])
+        result["market"] = market
+        return result
+
+    @staticmethod
+    def _resolve_player_names(
+        names: Sequence[str], candidate_ids: Iterable[str], players_db: Mapping[str, Mapping[str, Any]]
+    ) -> List[str]:
+        """Maps typed names to player ids among candidate_ids (exact, then unique partial match)."""
+        def norm(text: Any) -> str:
+            return "".join(ch for ch in str(text or "").lower() if ch.isalnum())
+
+        pool = {pid: norm(players_db.get(pid, {}).get("full_name")) for pid in candidate_ids}
+        out: List[str] = []
+        for raw in names:
+            target = norm(raw)
+            if not target:
+                continue
+            exact = [pid for pid, n in pool.items() if n == target]
+            matches = exact or [pid for pid, n in pool.items() if target in n]
+            if len(matches) == 1:
+                out.append(matches[0])
+            elif not matches:
+                raise ValueError(f"'{raw}' is not on the expected roster(s).")
+            else:
+                options = ", ".join(sorted(players_db[m].get("full_name", m) for m in matches))
+                raise ValueError(f"'{raw}' is ambiguous: {options}.")
+        return out
+
+    def evaluate_trade(
+        self,
+        give: Sequence[str],
+        get: Sequence[str],
+        league_id: Optional[str] = None,
+        username: Optional[str] = None,
+        n_sims: int = ROS_SIMS,
+    ) -> Dict[str, Any]:
+        """Rest-of-season evaluation of a specific trade (names or Sleeper ids).
+
+        `give` must be on the user's roster; `get` must all be on one other
+        roster (the trade partner, found automatically).
+        """
+        ctx = self.build_ros_context(league_id=league_id, username=username, n_sims=n_sims)
+        rosters, players_db, ui = ctx["rosters"], ctx["players_db"], ctx["user_index"]
+        give_ids = self._resolve_player_names(give, rosters[ui].all_ids(), players_db)
+        others = {pid: i for i, r in enumerate(rosters) if i != ui for pid in r.all_ids()}
+        get_ids = self._resolve_player_names(get, others.keys(), players_db)
+        partners = {others[pid] for pid in get_ids}
+        if len(partners) != 1:
+            raise ValueError("All players you get must come from a single opposing roster.")
+        pi = partners.pop()
+        season = {**ctx["season"], "partner_index": pi} if ctx.get("season") else None
+        result = evaluate_trade(
+            ctx["valuator"], rosters[ui], rosters[pi], give_ids, get_ids, ctx["free_agents"], mode="sim",
+            season=season,
+        )
+        result = self._attach_market(ctx, result, give_ids, get_ids, pi)
+        if season:
+            result["title_leverage"] = title_leverage(season, ui)
+        result.update({
+            "partner_name": ctx["manager_names"][pi],
+            "league_name": ctx["league_name"],
+            "scoring": ctx["scoring"],
+            "current_week": ctx["current_week"],
+            "trade_deadline": ctx["trade_deadline"],
+            "current_odds": ctx.get("current_odds"),
+            "notes": ctx["notes"],
+        })
+        return result
+
     def get_trending_movers(self, lookback_hours: int = 24) -> Dict[str, List[Dict[str, Any]]]:
         """Returns national trending adds and drops across fantasy football."""
         adds = self.sleeper.get_trending_adds(lookback_hours=lookback_hours, limit=10)
@@ -402,7 +912,7 @@ class FantasyAdvisor:
         """
         return self.depth_manager.get_all_sidelined_starters()
 
-    def get_player_intel(self, player_name: str, season: int = 2024) -> Dict[str, Any]:
+    def get_player_intel(self, player_name: str, season: int = DEFAULT_SEASON) -> Dict[str, Any]:
         """Deep dive dossier on a specific player: stats trajectory, depth chart, and relevant news."""
         self._ensure_engines([season])
         df = self._waiver_engine.df

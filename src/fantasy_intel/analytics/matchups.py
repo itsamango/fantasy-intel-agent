@@ -586,7 +586,9 @@ class MatchupAdvisor:
         p85 = self._to_float(metrics.get("proj_ceiling_p85"))
         if p15 is not None and p50 is not None and p85 is not None:
             return max(p15, 0.0), max(p50, 0.0), max(p85, 0.0)
-        xfp = self._to_float(metrics.get("rolling_xfp_3w"))
+        xfp = self._to_float(metrics.get("proj_ppg"))
+        if xfp is None:
+            xfp = self._to_float(metrics.get("rolling_xfp_3w"))
         if xfp is None:
             xfp = self._to_float(metrics.get("expected_fp_ppr"))
         if xfp is None or xfp <= 0:

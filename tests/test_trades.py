@@ -351,13 +351,15 @@ def test_buy_low_sell_high_rolling_thresholds():
     # buy-low: rolling xFP >= 12 paired with rolling FPOE <= -3
     assert buy_frame["rolling_xfp_3w"] == pytest.approx(17.6, abs=0.1)
     assert buy_frame["rolling_fpoe_3w"] <= -3.0
-    assert "Rolling 3-week xFP" in buy_low.iloc[0]["rationale"]
+    assert buy_frame["fpoe_excess_3w"] <= -3.0
+    assert "efficiency baseline" in buy_low.iloc[0]["rationale"]
 
     # sell-high: recent PPG >= 15 with rolling FPOE >= +4 on modest xFP
     assert sell_frame["recent_ppr"] >= 15.0
     assert sell_frame["rolling_fpoe_3w"] >= 4.0
     assert sell_frame["rolling_xfp_3w"] == pytest.approx(7.2, abs=0.1)
-    assert "FPOE" in sell_high.iloc[0]["rationale"]
+    assert sell_frame["fpoe_excess_3w"] >= 4.0
+    assert "efficiency baseline" in sell_high.iloc[0]["rationale"]
 
     # backward-compatible output shape
     for col in ("player_display_name", "position", "recent_team", "offense_pct", "touches",
