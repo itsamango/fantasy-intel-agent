@@ -171,3 +171,26 @@ def test_tep_premium_applies_to_tight_ends_only():
     assert out.loc["te", "expected_fp_ppr"] > out.loc["wr", "expected_fp_ppr"]
     assert out.loc["te", "fantasy_points_league"] == pytest.approx(15.0)
     assert out.loc["wr", "fantasy_points_league"] == pytest.approx(12.0)
+
+
+def test_unknown_schedule_drops_the_week_sleeper_still_calls_current(monkeypatch, tmp_path):
+    """Schedule unavailable: a team count cannot tell a finished bye-heavy week from one
+    waiting on Monday night, so the week Sleeper still calls current is dropped."""
+    monkeypatch.setattr(sleeper_mod, "SleeperClient", _WeeklySleeper)
+    loader = DataLoader(cache_dir=tmp_path)
+    monkeypatch.setattr(loader, "_expected_teams_by_week", lambda season: {})
+    df = loader.get_sleeper_weekly_data(season=2026)  # state week 3, data through week 3
+    assert sorted(df["week"].unique()) == [1, 2]
+    assert df.attrs["data_through_week"] == 2
+
+
+def test_unknown_schedule_keeps_a_week_sleeper_has_moved_past(monkeypatch, tmp_path):
+    class _Advanced(_WeeklySleeper):
+        def get_nfl_state(self):
+            return {"season": "2026", "week": 4, "season_type": "regular"}
+
+    monkeypatch.setattr(sleeper_mod, "SleeperClient", _Advanced)
+    loader = DataLoader(cache_dir=tmp_path)
+    monkeypatch.setattr(loader, "_expected_teams_by_week", lambda season: {})
+    df = loader.get_sleeper_weekly_data(season=2026)
+    assert sorted(df["week"].unique()) == [1, 2, 3]

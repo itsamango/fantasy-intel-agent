@@ -120,3 +120,51 @@ def test_sweeteners_never_sell_low():
     assert [o["add_player_id"] for o in opts] == ["ok"]
     reasons = {s["player_id"]: s["reason"] for s in skipped}
     assert reasons["cold"] == "running cold" and "selling low" in reasons["kyren"]
+
+
+def test_finder_screen_uses_perceived_values_like_the_tiering():
+    """A partner giving up a steep faller perceives the deal as fairer than raw values
+    say; the screen must not discard what assess_trade would tier PLAUSIBLE."""
+    weeks = [12, 13, 14, 15]
+
+    def o(pid, pos, pts):
+        return PlayerOutlook(pid, pid, pos, "KC", None, {w: pts for w in weeks}, {w: 1.0 for w in weeks})
+
+    shape = LeagueShape({"QB": 0, "RB": 1, "WR": 1, "TE": 0}, {}, 3, 0, weeks, {15})
+    outs = {"u1": o("u1", "RB", 15), "u2": o("u2", "RB", 14), "uw": o("uw", "WR", 4),
+            "t1": o("t1", "WR", 15), "t2": o("t2", "WR", 6), "tr": o("tr", "RB", 4)}  # partner lineup +1/wk
+    v = RosValuator(shape, outs, n_sims=0)
+    rosters = [RosterState(["u1", "u2", "uw"], []), RosterState(["t1", "t2", "tr"], [])]
+    values = {"u2": {"value": 3500.0}, "t1": {"value": 5000.0, "trend_30d": -5000.0},  # t1 down 50%
+              "u1": {"value": 9000.0}, "uw": {"value": 10.0}, "t2": {"value": 10.0}, "tr": {"value": 10.0}}
+    # raw: partner gets 3500 for 5000 (-17.6%, below the -10% screen); perceived: 3500 for 3750
+    assert assess_trade(values, ["u2"], ["t1"], 0.0)["tier"] in ("LIKELY", "PLAUSIBLE")
+    res = find_trades(v, rosters, 0, [], rescore_top=10, market_values=values)
+    assert any(p["you_send"][0]["player_id"] == "u2" and p["you_get"][0]["player_id"] == "t1"
+               for p in res["proposals"])
+
+
+def test_value_to_add_always_reaches_likely():
+    import random
+
+    rnd = random.Random(1)
+    for _ in range(500):
+        values = {"a": {"value": rnd.uniform(500, 5000)}, "b": {"value": rnd.uniform(500, 9000)}}
+        add = assess_trade(values, ["a"], ["b"], 0.0)["value_to_add"]
+        if add <= 0:
+            continue
+        values["s"] = {"value": add}
+        partner_m = -assess_trade(values, ["a", "s"], ["b"], 0.0)["gap_pct"]
+        assert partner_m >= MARKET_LIKELY_MIN - 1e-4  # gap_pct is rounded to 4 places
+
+
+def test_market_block_always_lists_skipped_sweeteners():
+    from fantasy_intel.agent.advisor import FantasyAdvisor
+
+    adv = FantasyAdvisor.__new__(FantasyAdvisor)
+    adv._market_values = lambda lc: {"a": {"value": 3000.0}, "b": {"value": 3000.0}}
+    ctx = {"league_context": {"total_rosters": 12}, "valuator": RosValuator(
+        LeagueShape({}, {}, 1, 0, [12], set()), {}, n_sims=0)}
+    result = {"partner": {"delta_per_week": 0.5}, "you_send": [], "you_get": []}
+    market = adv._attach_market(ctx, result, ["a"], ["b"], 1)["market"]
+    assert market["tier"] == "LIKELY" and market["sweeteners_skipped"] == []

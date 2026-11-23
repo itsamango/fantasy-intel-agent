@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 DEFAULT_WEEKLY_SD = 25.0
+NFL_LAST_WEEK = 18
 SEASON_SIMS = 4000
 
 
@@ -40,7 +41,8 @@ def bracket_order(slots: int) -> List[int]:
 
 def playoff_round_weeks(settings: Mapping[str, Any]) -> List[List[int]]:
     """Weeks belonging to each playoff round (round_type 0: one week each; 1: two-week
-    championship; 2: two weeks per round)."""
+    championship; 2: two weeks per round). Weeks past NFL_LAST_WEEK are cut, and a
+    round left with no weeks is dropped (no Sleeper league can play week 19+)."""
     start = int(settings.get("playoff_week_start") or 15)
     teams = int(settings.get("playoff_teams") or 6)
     rounds = max(1, math.ceil(math.log2(max(2, teams))))
@@ -49,7 +51,9 @@ def playoff_round_weeks(settings: Mapping[str, Any]) -> List[List[int]]:
     w = start
     for r in range(rounds):
         span = 2 if rtype == 2 or (rtype == 1 and r == rounds - 1) else 1
-        out.append(list(range(w, w + span)))
+        weeks = [x for x in range(w, w + span) if x <= NFL_LAST_WEEK]
+        if weeks:
+            out.append(weeks)
         w += span
     return out
 
@@ -87,9 +91,29 @@ class SeasonOdds:
     playoffs: np.ndarray
     bye: np.ndarray
     title: np.ndarray
+    # per-simulation outcomes (sims x teams, bool), for paired standard errors
+    made_playoffs: Optional[np.ndarray] = None
+    got_bye: Optional[np.ndarray] = None
+    won_title: Optional[np.ndarray] = None
 
     def for_team(self, i: int) -> Dict[str, float]:
         return {"playoffs": float(self.playoffs[i]), "bye": float(self.bye[i]), "title": float(self.title[i])}
+
+    def paired_se(self, other: "SeasonOdds", i: int) -> Dict[str, float]:
+        """Standard error of other - self for team i, both run on the same draws
+        (common random numbers make the per-simulation difference the right unit)."""
+        out: Dict[str, float] = {}
+        for k, a, b in (
+            ("playoffs", self.made_playoffs, other.made_playoffs),
+            ("bye", self.got_bye, other.got_bye),
+            ("title", self.won_title, other.won_title),
+        ):
+            if a is None or b is None or len(a) < 2:
+                out[k] = 0.0
+                continue
+            d = b[:, i].astype(float) - a[:, i].astype(float)
+            out[k] = float(d.std(ddof=1) / math.sqrt(len(d)))
+        return out
 
 
 class SeasonSimulator:
@@ -126,9 +150,9 @@ class SeasonSimulator:
         seeds = np.argsort(-key, axis=1)            # (sims, teams): seed k -> team index
         n_po = min(st.playoff_teams, n_teams)
         sims = np.arange(self.n_sims)
-        playoffs = np.zeros(n_teams)
+        made = np.zeros((self.n_sims, n_teams), dtype=bool)
         for k in range(n_po):
-            np.add.at(playoffs, seeds[:, k], 1.0)
+            made[sims, seeds[:, k]] = True
 
         slots = 2 ** max(1, math.ceil(math.log2(max(2, n_po))))
         order = bracket_order(slots)
@@ -137,7 +161,7 @@ class SeasonSimulator:
         for j, seed_no in enumerate(order):
             if seed_no <= n_po:
                 alive[:, j] = seeds[:, seed_no - 1]
-        bye = np.zeros(n_teams)
+        got_bye = np.zeros((self.n_sims, n_teams), dtype=bool)
         for r, round_weeks in enumerate(st.playoff_rounds):
             idx = [self.week_index[w] for w in round_weeks if w in self.week_index]
             if not idx:
@@ -150,14 +174,17 @@ class SeasonSimulator:
                 pb = np.where(b >= 0, round_pts[sims, np.maximum(b, 0)], -np.inf)
                 if r == 0:  # a team facing an empty slot has a first-round bye
                     for x, y in ((a, b), (b, a)):
-                        got_bye = (x >= 0) & (y < 0)
-                        np.add.at(bye, x[got_bye], 1.0)
+                        has_bye = (x >= 0) & (y < 0)
+                        got_bye[sims[has_bye], x[has_bye]] = True
                 nxt[:, j // 2] = np.where(pa >= pb, a, b)
             alive = nxt
             if alive.shape[1] == 1:
                 break
-        title = np.zeros(n_teams)
+        won = np.zeros((self.n_sims, n_teams), dtype=bool)
         champ = alive[:, 0]
-        np.add.at(title, champ[champ >= 0], 1.0)
-        n = float(self.n_sims)
-        return SeasonOdds(playoffs / n, bye / n, title / n)
+        ok = champ >= 0
+        won[sims[ok], champ[ok]] = True
+        return SeasonOdds(
+            made.mean(axis=0), got_bye.mean(axis=0), won.mean(axis=0),
+            made_playoffs=made, got_bye=got_bye, won_title=won,
+        )

@@ -36,6 +36,7 @@ from fantasy_intel.analytics.ros_value import (
     RosValuator,
     build_outlooks,
     evaluate_trade,
+    teams_kicked_off,
     teams_playing_from_schedule,
     top_free_agents,
 )
@@ -620,6 +621,7 @@ class FantasyAdvisor:
             rostered.update(active + reserve)
 
         notes: List[str] = []
+        scoring_settings = info.get("scoring_settings") or {}
         projections = {w: self.sleeper.get_week_projections(season=season, week=w) or {} for w in shape.weeks}
         try:
             schedule = self.loader.get_schedules([season])
@@ -627,6 +629,33 @@ class FantasyAdvisor:
             schedule = None
             notes.append(f"Schedule unavailable ({e}); byes not modeled.")
         teams_playing = teams_playing_from_schedule(schedule, shape.weeks)
+
+        # Current week: games already kicked off are banked, not re-projected
+        kicked = teams_kicked_off(schedule, start_week)
+        if schedule is None or getattr(schedule, "empty", True):
+            notes.append(f"Schedule unavailable: week {start_week} games already played may be counted again.")
+        locked_slots: Dict[str, str] = {}
+        banked = np.zeros(len(raw_rosters))
+        if kicked:
+            idx = {r.get("roster_id"): i for i, r in enumerate(raw_rosters)}
+            start_slots = [
+                str(s).upper() for s in (info.get("roster_positions") or [])
+                if str(s).upper() not in ("BN", "IR", "TAXI")
+            ]
+            team_of = {pid: (p or {}).get("team") for pid, p in players_db.items()}
+            for m in self.sleeper.get_matchups(league_id, start_week) or []:
+                i = idx.get(m.get("roster_id"))
+                pts = m.get("players_points") or {}
+                for slot, pid in zip(start_slots, m.get("starters") or []):
+                    pid = str(pid)
+                    if pid and pid != "0" and team_of.get(pid) in kicked:
+                        locked_slots[pid] = slot
+                        if i is not None:
+                            banked[i] += float(pts.get(pid) or 0.0)
+            notes.append(
+                f"Week {start_week} in progress: {len(kicked) // 2} game(s) kicked off; those players' "
+                "points are taken from live scores, not projections."
+            )
 
         fallback: Dict[str, float] = {}
         if use_model_fallback:
@@ -643,27 +672,38 @@ class FantasyAdvisor:
         projected = {pid for wk in projections.values() for pid in wk}
         candidate_ids = (skill_ids & (rostered | projected | set(fallback)))
         outlooks = build_outlooks(
-            candidate_ids, players_db, projections, teams_playing, shape.weeks, scoring, fallback_ppg=fallback
+            candidate_ids, players_db, projections, teams_playing, shape.weeks, scoring,
+            fallback_ppg=fallback, scoring_settings=scoring_settings, kicked_off=kicked,
         )
         free_agents = top_free_agents(outlooks, rostered, per_position=fa_per_position)
         notes.append(
             f"Weeks {shape.weeks[0]}-{shape.weeks[-1]} (playoffs {sorted(shape.playoff_weeks)}); "
-            f"projections: Sleeper weekly, model proj_ppg fallback; {n_sims} availability simulations."
+            f"projections: Sleeper weekly scored with this league's settings, model proj_ppg fallback; "
+            f"{n_sims} availability simulations."
         )
-        valuator = RosValuator(shape, outlooks, n_sims=n_sims)
+        valuator = RosValuator(shape, outlooks, n_sims=n_sims, locked_slots=locked_slots)
         season_ctx = None
         current_odds = None
-        try:
-            season_ctx = self._build_season(league_id, info, raw_rosters, rosters, valuator, user_index)
-            current_odds = season_ctx["sim"].run(season_ctx["base_means"]).for_team(user_index)
+        playoff_start = int((info.get("settings") or {}).get("playoff_week_start") or 15)
+        if start_week > playoff_start:
             notes.append(
-                f"Standings-aware: {season_ctx['sim'].n_sims} season simulations (schedule, records, "
-                f"weekly SD {season_ctx['sim'].state.weekly_sd:.1f} from this league's scores); "
-                "verdicts use change in title odds."
+                f"Playoffs under way (week {start_week}): the season simulator would replay decided "
+                "rounds, so title odds are off and verdicts use lineup points."
             )
-        except Exception as e:
-            logger.warning(f"Season simulation unavailable: {e}")
-            notes.append(f"Standings simulation unavailable ({e}); verdicts use lineup points.")
+        else:
+            try:
+                season_ctx = self._build_season(
+                    league_id, info, raw_rosters, rosters, valuator, user_index, banked_points=banked
+                )
+                current_odds = season_ctx["sim"].run(season_ctx["base_means"]).for_team(user_index)
+                notes.append(
+                    f"Standings-aware: {season_ctx['sim'].n_sims} season simulations (schedule, records, "
+                    f"weekly SD {season_ctx['sim'].state.weekly_sd:.1f} from this league's scores); "
+                    "verdicts use change in title odds."
+                )
+            except Exception as e:
+                logger.warning(f"Season simulation unavailable: {e}")
+                notes.append(f"Standings simulation unavailable ({e}); verdicts use lineup points.")
         return {
             "valuator": valuator,
             "season": season_ctx,
@@ -693,8 +733,12 @@ class FantasyAdvisor:
         rosters: Sequence[RosterState],
         valuator: RosValuator,
         user_index: int,
+        banked_points: Optional[np.ndarray] = None,
     ) -> Dict[str, Any]:
-        """SeasonSimulator inputs from Sleeper: records, remaining schedule, weekly SD, team strength."""
+        """SeasonSimulator inputs from Sleeper: records, remaining schedule, weekly SD, team strength.
+
+        banked_points (per team): current-week points already scored by starters
+        whose game kicked off; added to the current week's projected mean."""
         settings = info.get("settings") or {}
         playoff_start = int(settings.get("playoff_week_start") or 15)
         weeks = valuator.shape.weeks
@@ -739,7 +783,13 @@ class FantasyAdvisor:
             per_week = valuator.team_value(r.all_ids(), "sim").per_week
             fill = float(np.mean(list(per_week.values()))) if per_week else 0.0
             base[i] = [per_week.get(w, fill) for w in state.weeks]
-        return {"sim": sim, "base_means": base, "user_index": user_index}
+        w0 = weeks[0] if weeks else None
+        if banked_points is not None and w0 in state.weeks:
+            base[:, state.weeks.index(w0)] += banked_points
+        return {
+            "sim": sim, "base_means": base, "user_index": user_index,
+            "banked_points": banked_points, "current_week": w0,
+        }
 
     def _market_values(self, league_context: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
         """FantasyCalc redraft values for this league's settings ({} when unavailable)."""
@@ -771,6 +821,7 @@ class FantasyAdvisor:
             f"FantasyCalc redraft ({params['numQbs']}QB, {params['numTeams']} teams, {params['ppr']:g} PPR)"
         )
         market["sweeteners"] = []
+        market["sweeteners_skipped"] = []
         if find_sweeteners_if_needed and market["tier"] in ("PLAUSIBLE", "UNLIKELY") and market["value_to_add"] > 0:
             ui = ctx["user_index"]
             rosters = ctx["rosters"]
@@ -781,7 +832,7 @@ class FantasyAdvisor:
                 for pid, e in excess.items()
                 if e is not None and e <= BUY_LOW_MAX_ROLLING_FPOE
             }
-            skipped: List[Dict[str, Any]] = []
+            skipped = market["sweeteners_skipped"]
             market["sweeteners"] = find_sweeteners(
                 values,
                 rosters[ui].all_ids(),
@@ -796,7 +847,6 @@ class FantasyAdvisor:
                 exclude=cold,
                 skipped=skipped,
             )
-            market["sweeteners_skipped"] = skipped
         for card in result.get("you_send", []) + result.get("you_get", []):
             mv = values.get(str(card.get("player_id"))) or {}
             card["market_value"] = round(mv["value"]) if mv else 0

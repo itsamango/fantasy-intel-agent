@@ -94,7 +94,6 @@ ROS_FA_CANDIDATES_PER_POS = 5
 # drop->add swaps (a trade must not get credit for pickups available anyway).
 ROS_WAIVER_MAX_SWAPS = 3
 ROS_WAIVER_MIN_GAIN_PPW = 0.1
-ROS_WAIVER_DROP_CANDIDATES = 6  # lowest-ROS active players considered for dropping
 # Standings-aware verdicts: a trade changing your title odds by less than this
 # (absolute probability, 0.005 = 0.5 percentage points) is called neutral.
 ROS_TITLE_VERDICT_MARGIN = 0.005

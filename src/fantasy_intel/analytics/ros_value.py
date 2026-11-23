@@ -22,6 +22,9 @@ Pure module: no network or file I/O. The advisor gathers inputs.
 
 from __future__ import annotations
 
+import datetime as dt
+import functools
+import itertools
 import math
 import zlib
 from dataclasses import dataclass, field
@@ -29,6 +32,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 
 import numpy as np
 
+from fantasy_intel.analytics.market import perceived_value
+from fantasy_intel.analytics.standings import playoff_round_weeks
 from fantasy_intel.config import (
     ROS_AVAILABILITY_BY_POS,
     ROS_FA_CANDIDATES_PER_POS,
@@ -37,7 +42,6 @@ from fantasy_intel.config import (
     ROS_SIMS,
     ROS_TITLE_VERDICT_MARGIN,
     ROS_VERDICT_MARGIN_PPW,
-    ROS_WAIVER_DROP_CANDIDATES,
     ROS_WAIVER_MAX_SWAPS,
     ROS_WAIVER_MIN_GAIN_PPW,
     SCORING_HALF_PPR,
@@ -52,9 +56,27 @@ FLEX_ELIGIBILITY: Dict[str, Set[str]] = {
     "FLEX": {"RB", "WR", "TE"},
     "SUPER_FLEX": {"QB", "RB", "WR", "TE"},
 }
-# Most restrictive first: greedy fill is optimal for nested eligibility sets
 FLEX_ORDER = ("REC_FLEX", "WRRB_FLEX", "FLEX", "SUPER_FLEX")
 NON_ACTIVE_SLOTS = {"IR", "TAXI"}
+
+
+@functools.lru_cache(maxsize=None)
+def _flex_patterns(flex_counts: Tuple[Tuple[str, int], ...]) -> Tuple[Tuple[int, ...], ...]:
+    """Every feasible (QB, RB, WR, TE) count vector the flex slots can hold.
+
+    The best lineup fills dedicated slots with each position's top players, then
+    picks the pattern whose next-best players sum highest. Enumerating patterns
+    is exact for any mix of flex types (greedy fill is not when REC_FLEX and
+    WRRB_FLEX coexist) and independent of tie order."""
+    slots = [f for f, n in flex_counts for _ in range(n)]
+    pats: Set[Tuple[int, ...]] = set()
+    for choice in itertools.product(*(sorted(FLEX_ELIGIBILITY[f]) for f in slots)):
+        pats.add(tuple(choice.count(p) for p in SKILL_POSITIONS))
+    return tuple(sorted(pats))
+
+
+def _flex_key(flex: Mapping[str, int]) -> Tuple[Tuple[str, int], ...]:
+    return tuple((f, int(flex.get(f, 0))) for f in FLEX_ORDER if flex.get(f, 0) > 0)
 
 
 # --------------------------------------------------------------------------- #
@@ -91,11 +113,9 @@ class LeagueShape:
             elif slot in flex:
                 flex[slot] += 1
         playoff_start = int(settings.get("playoff_week_start") or 15)
-        playoff_teams = int(settings.get("playoff_teams") or 6)
-        rounds = max(1, math.ceil(math.log2(max(2, playoff_teams))))
-        if int(settings.get("playoff_round_type") or 0) == 2:
-            rounds *= 2  # two-week championship round variants
-        last_week = min(18, playoff_start + rounds - 1)
+        # Same round weeks as the season simulator's bracket, so the two cannot diverge
+        rounds = playoff_round_weeks(settings)
+        last_week = max([w for r in rounds for w in r], default=playoff_start - 1)
         weeks = list(range(max(1, int(start_week)), last_week + 1))
         return cls(
             dedicated=dedicated,
@@ -135,6 +155,31 @@ def teams_playing_from_schedule(schedule: Any, weeks: Sequence[int]) -> Dict[int
     return out
 
 
+SCHEDULE_TZ = "America/New_York"  # nflverse gameday/gametime are US Eastern
+
+
+def teams_kicked_off(schedule: Any, week: int, now: Optional[dt.datetime] = None) -> Set[str]:
+    """Sleeper team codes whose game in `week` has kicked off by `now` (default: current time).
+
+    Their players' points for that week are already banked (or lost): the ROS
+    engine must not count them again as if the game were still to be played."""
+    if schedule is None or getattr(schedule, "empty", True) or "gameday" not in schedule.columns:
+        return set()
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(SCHEDULE_TZ)
+    now = now.astimezone(tz) if now is not None and now.tzinfo else (now.replace(tzinfo=tz) if now else dt.datetime.now(tz))
+    out: Set[str] = set()
+    for _, g in schedule[schedule["week"] == week].iterrows():
+        try:
+            kick = dt.datetime.strptime(f"{g['gameday']} {g.get('gametime') or '13:00'}", "%Y-%m-%d %H:%M")
+        except (TypeError, ValueError):
+            continue
+        if kick.replace(tzinfo=tz) <= now:
+            out.update({sleeper_team_code(g["home_team"]), sleeper_team_code(g["away_team"])})
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Player outlooks
 # --------------------------------------------------------------------------- #
@@ -156,10 +201,35 @@ class PlayerOutlook:
         return sum(self.expected(w) for w in self.weekly)
 
 
-def projection_points(proj: Mapping[str, Any], scoring: str, position: str) -> Optional[float]:
-    """League-scoring points from a Sleeper projection record (None when absent)."""
+def projection_points(
+    proj: Mapping[str, Any],
+    scoring: str,
+    position: str,
+    scoring_settings: Optional[Mapping[str, Any]] = None,
+) -> Optional[float]:
+    """League-scoring points from a Sleeper projection record (None when absent).
+
+    With the league's `scoring_settings`, points are the dot product of the
+    projected stat lines and the league's per-stat values, so 6-pt passing TDs,
+    first-down bonuses, TE premium (bonus_rec_te), etc. count exactly as the
+    league scores them (checked: reproduces Sleeper's pts_ppr / pts_half_ppr to
+    within 0.1 on default-scoring leagues). Falls back to Sleeper's
+    precomputed pts_* totals when there are no settings or no stat keys."""
     if not proj:
         return None
+    if scoring_settings:
+        pts, matched = 0.0, False
+        for k, v in proj.items():
+            mult = scoring_settings.get(k)
+            if mult is None or k.startswith("pts_") or not isinstance(v, (int, float)):
+                continue
+            try:
+                pts += float(v) * float(mult)
+            except (TypeError, ValueError):
+                continue
+            matched = True
+        if matched:
+            return pts
     key = {SCORING_HALF_PPR: "pts_half_ppr", SCORING_STANDARD: "pts_std"}.get(scoring, "pts_ppr")
     val = proj.get(key)
     if val is None:
@@ -178,18 +248,24 @@ def build_outlooks(
     weeks: Sequence[int],
     scoring: str,
     fallback_ppg: Optional[Mapping[str, float]] = None,
+    scoring_settings: Optional[Mapping[str, Any]] = None,
+    kicked_off: Optional[Set[str]] = None,
 ) -> Dict[str, PlayerOutlook]:
     """Weekly projection + availability per skill player.
 
     Projection: Sleeper's weekly projection (out-of-sample on 2026 wks 5-10 it
     beat our model: MAE 5.02 vs 5.47, corr 0.633 vs 0.548, and blending did not
-    help). Players Sleeper does not project fall back to our proj_ppg unless
-    they carry an IR/Out-type tag (no projection then means not expected back).
-    Byes (team absent from the schedule) are 0.
+    help), scored with the league's scoring_settings when given. Players Sleeper
+    does not project fall back to our proj_ppg unless they carry an IR/Out-type
+    tag (no projection then means not expected back).
+    Byes (team absent from the schedule) are 0. In the first (current) week,
+    players on teams in `kicked_off` are 0 with source "played": their points
+    are already banked and are added separately from live scores.
     Availability: ROS_AVAILABILITY_BY_POS base rate; the first remaining week
     uses ROS_NEXT_WEEK_STATUS_AVAILABILITY for tagged players.
     """
     fallback_ppg = fallback_ppg or {}
+    kicked_off = kicked_off or set()
     first_week = min(weeks) if weeks else None
     out: Dict[str, PlayerOutlook] = {}
     for pid in player_ids:
@@ -209,7 +285,12 @@ def build_outlooks(
             if not team or (playing is not None and team not in playing):
                 weekly[w], avail[w], source[w] = 0.0, 0.0, "bye" if team else "free_agent_team"
                 continue
-            pts = projection_points((projections_by_week.get(w) or {}).get(pid) or {}, scoring, pos)
+            if w == first_week and team in kicked_off:
+                weekly[w], avail[w], source[w] = 0.0, 0.0, "played"
+                continue
+            pts = projection_points(
+                (projections_by_week.get(w) or {}).get(pid) or {}, scoring, pos, scoring_settings
+            )
             if pts is None:
                 if status in ROS_NO_PROJECTION_STATUSES:
                     weekly[w], avail[w], source[w] = 0.0, 0.0, "injured"
@@ -257,23 +338,37 @@ def _solve_week(by_pos: Dict[str, List[float]], dedicated: Dict[str, int], flex:
         n = dedicated.get(pos, 0)
         total += sum(vals[:n])
         left[pos] = vals[n:]
-    heads = {pos: 0 for pos in SKILL_POSITIONS}
-    for ftype in FLEX_ORDER:
-        for _ in range(flex.get(ftype, 0)):
-            best_pos, best_val = None, 0.0
-            for pos in FLEX_ELIGIBILITY[ftype]:
-                i = heads[pos]
-                if i < len(left[pos]) and left[pos][i] > best_val:
-                    best_pos, best_val = pos, left[pos][i]
-            if best_pos is None:
-                break
-            heads[best_pos] += 1
-            total += best_val
-    return total
+    pats = _flex_patterns(_flex_key(flex))
+    if not pats:
+        return total
+    return total + max(
+        sum(sum(left[p][:c]) for p, c in zip(SKILL_POSITIONS, pat)) for pat in pats
+    )
+
+
+def reduce_slots(
+    dedicated: Mapping[str, int], flex: Mapping[str, int], used: Iterable[str]
+) -> Tuple[Dict[str, int], Dict[str, int]]:
+    """Starting slots left after removing `used` slot names (e.g. slots whose
+    starter's game is already played this week)."""
+    ded, fl = dict(dedicated), dict(flex)
+    for slot in used:
+        slot = str(slot).upper()
+        if ded.get(slot, 0) > 0:
+            ded[slot] -= 1
+        elif fl.get(slot, 0) > 0:
+            fl[slot] -= 1
+    return ded, fl
 
 
 class RosValuator:
-    """Expected ROS optimal-lineup points for any set of players."""
+    """Expected ROS optimal-lineup points for any set of players.
+
+    `locked_slots` ({player_id: slot}) are current-week starters whose game has
+    kicked off: their points are banked outside this model (live scores), so in
+    the first week the slot each occupies is unavailable to the rest of the
+    roster. The slot follows the player id (a locked starter traded mid-week
+    takes the slot with him; Sleeper's real handling of that case is unverified)."""
 
     def __init__(
         self,
@@ -281,14 +376,22 @@ class RosValuator:
         outlooks: Mapping[str, PlayerOutlook],
         n_sims: int = ROS_SIMS,
         seed: int = 7,
+        locked_slots: Optional[Mapping[str, str]] = None,
     ):
         self.shape = shape
         self.outlooks = dict(outlooks)
         self.n_sims = int(n_sims)
         self.seed = int(seed)
+        self.locked_slots = {str(k): str(v) for k, v in (locked_slots or {}).items()}
         self._draw_cache: Dict[str, np.ndarray] = {}
         self._value_cache: Dict[Tuple[frozenset, str], TeamValue] = {}
         self._waiver_cache: Dict[Tuple, Tuple["RosterState", List[Dict[str, Any]]]] = {}
+
+    def _slots_for(self, week: int, pids: Iterable[str]) -> Tuple[Dict[str, int], Dict[str, int]]:
+        if not self.locked_slots or not self.shape.weeks or week != self.shape.weeks[0]:
+            return self.shape.dedicated, self.shape.flex
+        used = [self.locked_slots[p] for p in pids if p in self.locked_slots]
+        return reduce_slots(self.shape.dedicated, self.shape.flex, used)
 
     def _draws(self, pid: str) -> np.ndarray:
         """Per-player uniforms (sims x weeks), identical on every roster (common random numbers)."""
@@ -303,34 +406,46 @@ class RosValuator:
         key = (frozenset(str(p) for p in pids), mode)
         if key in self._value_cache:
             return self._value_cache[key]
-        players = [self.outlooks[p] for p in key[0] if p in self.outlooks]
+        # sorted ids: iteration order of a frozenset of str varies per process
+        players = [self.outlooks[p] for p in sorted(key[0]) if p in self.outlooks]
         weeks = self.shape.weeks
         per_week: Dict[int, float] = {}
         for wi, w in enumerate(weeks):
-            # pre-sort each position by projection so filtered lists stay sorted
-            ranked = sorted(players, key=lambda o: o.weekly.get(w, 0.0), reverse=True)
+            dedicated, flex = self._slots_for(w, key[0])
             if mode == "expected" or self.n_sims <= 0:
                 by_pos: Dict[str, List[float]] = {}
-                for o in sorted(players, key=lambda o: o.expected(w), reverse=True):
+                for o in sorted(players, key=lambda o: -o.expected(w)):
                     v = o.expected(w)
                     if v > 0:
                         by_pos.setdefault(o.position, []).append(v)
-                per_week[w] = _solve_week(by_pos, self.shape.dedicated, self.shape.flex)
+                per_week[w] = _solve_week(by_pos, dedicated, flex)
                 continue
-            per_week[w] = self._simulate_week(ranked, w, wi)
+            # pre-sort by projection (stable on the sorted ids) so filtered lists stay sorted
+            ranked = sorted(players, key=lambda o: -o.weekly.get(w, 0.0))
+            per_week[w] = self._simulate_week(ranked, w, wi, dedicated, flex)
         regular = sum(v for w, v in per_week.items() if w not in self.shape.playoff_weeks)
         playoffs = sum(v for w, v in per_week.items() if w in self.shape.playoff_weeks)
         tv = TeamValue(per_week=per_week, regular=regular, playoffs=playoffs)
         self._value_cache[key] = tv
         return tv
 
-    def _simulate_week(self, ranked: Sequence[PlayerOutlook], week: int, wi: int) -> float:
+    def _simulate_week(
+        self,
+        ranked: Sequence[PlayerOutlook],
+        week: int,
+        wi: int,
+        dedicated: Optional[Mapping[str, int]] = None,
+        flex: Optional[Mapping[str, int]] = None,
+    ) -> float:
         """Mean best-lineup points over all availability simulations for one week.
 
-        Vectorized greedy (identical picks to _solve_week): players are sorted by
-        projection, so within any eligibility group the top-n *available* players
-        are the available ones whose running available-count is <= n. Dedicated
-        slots fill first, then flex types from most to least restrictive."""
+        Vectorized version of _solve_week: players are sorted by projection, so
+        within a position the top-n *available* players are the available ones
+        whose running available-count is <= n. Dedicated slots take each
+        position's top players; the flex slots then take the best feasible
+        pattern (per simulation) of each position's next-best players."""
+        dedicated = self.shape.dedicated if dedicated is None else dedicated
+        flex = self.shape.flex if flex is None else flex
         if not ranked:
             return 0.0
         vals = np.array([o.weekly.get(week, 0.0) for o in ranked])
@@ -350,9 +465,25 @@ class RosValuator:
             left[:, cols] = sub & ~take
 
         for p in SKILL_POSITIONS:
-            fill(np.flatnonzero(pos == p), self.shape.dedicated.get(p, 0))
-        for f in FLEX_ORDER:
-            fill(np.flatnonzero(np.isin(pos, list(FLEX_ELIGIBILITY[f]))), self.shape.flex.get(f, 0))
+            fill(np.flatnonzero(pos == p), dedicated.get(p, 0))
+        pats = _flex_patterns(_flex_key(flex))
+        if pats:
+            k_max = max(max(pat) for pat in pats)
+            # topk[p][k] = per-sim sum of position p's k best remaining available players
+            topk: Dict[str, np.ndarray] = {}
+            for p in SKILL_POSITIONS:
+                arr = np.zeros((k_max + 1, self.n_sims))
+                cols = np.flatnonzero(pos == p)
+                if cols.size:
+                    sub = left[:, cols]
+                    rank = np.cumsum(sub, axis=1)
+                    for k in range(1, k_max + 1):
+                        arr[k] = (sub & (rank <= k)) @ vals[cols]
+                topk[p] = arr
+            best = np.max(
+                np.stack([sum(topk[p][c] for p, c in zip(SKILL_POSITIONS, pat)) for pat in pats]), axis=0
+            )
+            total += best
         return float(total.mean())
 
     # ------------------------------------------------------------------ #
@@ -431,7 +562,7 @@ def optimize_waivers(
     keep: Iterable[str] = (),
     max_swaps: int = ROS_WAIVER_MAX_SWAPS,
     min_gain_ppw: float = ROS_WAIVER_MIN_GAIN_PPW,
-    drop_candidates: int = ROS_WAIVER_DROP_CANDIDATES,
+    drop_candidates: Optional[int] = None,
 ) -> Tuple[RosterState, List[Dict[str, Any]]]:
     """The roster after its best free waiver moves (greedy drop->add swaps, simulated value).
 
@@ -439,10 +570,16 @@ def optimize_waivers(
     pickup the team could make anyway (e.g. a 2-for-1 opening a spot that is
     then filled by a free agent who was always available). Players in `keep`
     (the ones being traded) are never dropped. Open spots are filled first.
+    Every droppable active player is a drop candidate (a redundant backup QB
+    can be the right drop even with a high projection); `drop_candidates`
+    limits the search to that many lowest-ROS players (tests / speed only).
     """
     keep = set(keep)
     pool = tuple(p for p in free_agents if p in valuator.outlooks and p not in roster.all_ids())
-    key = (frozenset(roster.active), frozenset(roster.reserve), frozenset(keep), pool)
+    key = (
+        frozenset(roster.active), frozenset(roster.reserve), frozenset(roster.protected), frozenset(keep), pool,
+        int(max_swaps), float(min_gain_ppw), drop_candidates,
+    )
     if key in valuator._waiver_cache:
         r, moves = valuator._waiver_cache[key]
         return r.copy(), list(moves)
@@ -457,8 +594,8 @@ def optimize_waivers(
     for _ in range(max_swaps):
         base = valuator.team_value(r.all_ids(), "sim").total
         droppable = sorted(
-            (p for p in r.active if p in valuator.outlooks and p not in keep),
-            key=lambda p: valuator.outlooks[p].ros_expected(),
+            (p for p in r.active if p in valuator.outlooks and p not in keep and p not in r.protected),
+            key=lambda p: (valuator.outlooks[p].ros_expected(), p),
         )[:drop_candidates]
         best = (min_gain_ppw * n_weeks, None, None)
         for f in remaining:
@@ -512,12 +649,8 @@ def plan_waiver_moves(
     def odds_for(per_week: Mapping[int, float]) -> Optional[Dict[str, float]]:
         if not season:
             return None
-        sim, ui = season["sim"], season["user_index"]
-        means = np.array(season["base_means"], dtype=float, copy=True)
-        for j, w in enumerate(sim.state.weeks):
-            if w in per_week:
-                means[ui, j] = per_week[w]
-        return sim.run(means).for_team(ui)
+        ui = season["user_index"]
+        return season["sim"].run(season_means(season, {ui: per_week})).for_team(ui)
 
     cur = roster.copy()
     v0 = valuator.team_value(cur.all_ids(), "sim")
@@ -539,10 +672,7 @@ def plan_waiver_moves(
 
     # Runner-up single swaps from the final roster (best drop for each remaining FA)
     base = valuator.team_value(cur.all_ids(), "sim").total
-    droppable = sorted(
-        (p for p in cur.active if p in valuator.outlooks),
-        key=lambda p: valuator.outlooks[p].ros_expected(),
-    )[:ROS_WAIVER_DROP_CANDIDATES]
+    droppable = [p for p in cur.active if p in valuator.outlooks and p not in cur.protected]
     alts: List[Dict[str, Any]] = []
     for f in free_agents:
         if f not in valuator.outlooks or f in cur.all_ids():
@@ -573,7 +703,7 @@ def representative_lineup(valuator: RosValuator, ids: Iterable[str]) -> Dict[str
     n_weeks = max(1, len(valuator.shape.weeks))
     players = sorted(
         (valuator.outlooks[p] for p in ids if p in valuator.outlooks),
-        key=lambda o: o.ros_expected(), reverse=True,
+        key=lambda o: (-o.ros_expected(), o.player_id),
     )
     used: Set[str] = set()
     starters: List[Dict[str, Any]] = []
@@ -693,17 +823,14 @@ def evaluate_trade(
     b["waiver_moves"] = b_moves
     odds = _season_odds(season, a, b) if season else None
     if odds is not None:
-        d_you, d_them = odds["you"]["delta"]["title"], odds["partner"]["delta"]["title"]
+        verdict = title_verdict(
+            odds["you"]["delta"]["title"], odds["you"]["delta_se"]["title"], odds["partner"]["delta"]["title"]
+        )
         m = ROS_TITLE_VERDICT_MARGIN
-        if d_you >= m and d_them >= 0:
-            verdict = "WIN-WIN (raises both teams' title odds)"
-        elif d_you >= m:
-            verdict = "FAVORS YOU"
-        elif d_you <= -m:
-            verdict = "HURTS YOU"
-        else:
-            verdict = "ROUGHLY NEUTRAL FOR YOU"
-        verdict_basis = f"title odds (|Δ| < {m:.1%} = neutral)"
+        verdict_basis = (
+            f"title odds (|Δ| < {m:.1%} = neutral; too close to call when the ±2 SE "
+            "simulation-noise band spans a verdict boundary)"
+        )
     else:
         margin = ROS_VERDICT_MARGIN_PPW
         if a["delta_per_week"] >= margin and b["delta_per_week"] >= 0:
@@ -747,23 +874,56 @@ def evaluate_trade(
     }
 
 
-def _season_odds(season: Mapping[str, Any], a: Dict[str, Any], b: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Playoff / bye / title odds for both teams before and after (common random numbers)."""
+def title_verdict(d_you: float, se: float, d_them: float, margin: float = ROS_TITLE_VERDICT_MARGIN) -> str:
+    """Verdict from your title-odds change, aware of simulation noise.
+
+    The verdict is called only when the whole d ± 2·SE band lies in one
+    category (>= margin, <= -margin, or strictly between). Otherwise the
+    season simulations cannot tell which side of a boundary the trade is on."""
+    lo, hi = d_you - 2 * se, d_you + 2 * se
+    if lo >= margin:
+        return "WIN-WIN (raises both teams' title odds)" if d_them >= 0 else "FAVORS YOU"
+    if hi <= -margin:
+        return "HURTS YOU"
+    if -margin < lo and hi < margin:
+        return "ROUGHLY NEUTRAL FOR YOU"
+    return "TOO CLOSE TO CALL (within simulation noise)"
+
+
+def season_means(season: Mapping[str, Any], overrides: Mapping[int, Mapping[int, float]]) -> np.ndarray:
+    """base_means with some teams' weekly lineup means replaced.
+
+    `season["banked_points"]` (per team) are current-week points already scored
+    by starters whose game has kicked off; the valuator zeroes those players, so
+    they are added back to the current week here (base_means already include them)."""
     sim = season["sim"]
-    weeks = sim.state.weeks
+    means = np.array(season["base_means"], dtype=float, copy=True)
+    banked = season.get("banked_points")
+    w0 = season.get("current_week")
+    for team, per_week in overrides.items():
+        for j, w in enumerate(sim.state.weeks):
+            if w in per_week:
+                extra = float(banked[team]) if banked is not None and w == w0 else 0.0
+                means[team, j] = per_week[w] + extra
+    return means
+
+
+def _season_odds(season: Mapping[str, Any], a: Dict[str, Any], b: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Playoff / bye / title odds for both teams before and after (common random
+    numbers), with the paired standard error of each change."""
+    sim = season["sim"]
     ui, pi = season["user_index"], season["partner_index"]
-    before = np.array(season["base_means"], dtype=float, copy=True)
-    after = before.copy()
-    for team, side in ((ui, a), (pi, b)):
-        for j, w in enumerate(weeks):
-            if w in side["per_week_before"]:
-                before[team, j] = side["per_week_before"][w]
-                after[team, j] = side["per_week_after"][w]
+    before = season_means(season, {ui: a["per_week_before"], pi: b["per_week_before"]})
+    after = season_means(season, {ui: a["per_week_after"], pi: b["per_week_after"]})
     o0, o1 = sim.run(before), sim.run(after)
 
     def pack(i: int) -> Dict[str, Any]:
         b0, b1 = o0.for_team(i), o1.for_team(i)
-        return {"before": b0, "after": b1, "delta": {k: b1[k] - b0[k] for k in b0}}
+        return {
+            "before": b0, "after": b1,
+            "delta": {k: b1[k] - b0[k] for k in b0},
+            "delta_se": o0.paired_se(o1, i),
+        }
 
     return {"you": pack(ui), "partner": pack(pi), "n_sims": sim.n_sims, "weekly_sd": sim.state.weekly_sd}
 
@@ -857,8 +1017,9 @@ def find_trades(
     def partner_market_pct(give: Sequence[str], get: Sequence[str]) -> Optional[float]:
         if not market_values:
             return None
-        send = sum(float((market_values.get(p) or {}).get("value", 0.0)) for p in give)
-        recv = sum(float((market_values.get(p) or {}).get("value", 0.0)) for p in get)
+        # perceived values, as assess_trade uses, so the screen agrees with the tiering
+        send = sum(perceived_value(market_values, p) for p in give)
+        recv = sum(perceived_value(market_values, p) for p in get)
         total = send + recv
         return None if total < min_market_total else (send - recv) / total
 

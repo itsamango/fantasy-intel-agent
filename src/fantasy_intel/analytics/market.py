@@ -9,6 +9,7 @@ inside each player's value).
 
 from __future__ import annotations
 
+import math
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from fantasy_intel.config import (
@@ -110,7 +111,8 @@ def assess_trade(
         "gap_pct": round(gap, 4),
         "fair": fair,
         "tier": acceptance_tier(partner_m, partner_lineup_ppw),
-        "value_to_add": round(max(0.0, need)),
+        # ceil: a rounded-down amount can leave the sweetened deal just short of LIKELY
+        "value_to_add": float(math.ceil(max(0.0, need))),
         "summary": summary,
     }
 

@@ -91,10 +91,6 @@ SLEEPER_WEEKLY_STAT_MAP = {
     "tm_off_snp": "team_offense_snaps",
 }
 
-# A week counts as complete when at least this many teams have stat lines
-# (the most byes in any week is 6 -> 26 teams) unless the schedule says fewer.
-MIN_TEAMS_FOR_COMPLETE_WEEK = 26
-
 SCHEDULE_COLUMNS = [
     "season",
     "week",
@@ -783,11 +779,18 @@ class DataLoader:
         last_week = int(df["week"].max())
         if not include_partial_week and live:
             teams_seen = df.loc[df["week"] == last_week, "recent_team"].nunique()
-            expected = self._expected_teams_by_week(season).get(last_week, MIN_TEAMS_FOR_COMPLETE_WEEK)
-            if teams_seen < expected:
-                logger.info(
-                    f"Week {last_week} incomplete ({teams_seen}/{expected} teams reported); excluding it."
-                )
+            expected = self._expected_teams_by_week(season).get(last_week)
+            if expected is not None:
+                incomplete = teams_seen < expected
+                reason = f"{teams_seen}/{expected} teams reported"
+            else:
+                # Schedule unknown: a team count cannot tell a finished 14-game week from
+                # a 16-game week waiting on Monday night. Sleeper's state week is the week
+                # in progress, so only an earlier week is known to be over.
+                incomplete = last_week >= state_week
+                reason = f"schedule unavailable and week {last_week} is still Sleeper's current week"
+            if incomplete:
+                logger.info(f"Week {last_week} incomplete ({reason}); excluding it.")
                 df = df[df["week"] < last_week].copy()
                 last_week -= 1
 
