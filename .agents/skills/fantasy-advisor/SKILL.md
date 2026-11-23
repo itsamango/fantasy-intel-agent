@@ -91,11 +91,12 @@ title odds). Mention them whenever you answer a trade question too (`you.waiver_
 
 | Field | Meaning |
 |---|---|
-| `verdict`, `verdict_basis` | Judged by change in the user's **title odds** (±0.5 pts = neutral) when standings are available, else by lineup pts/week |
+| `verdict`, `verdict_basis` | Judged by change in the user's **title odds** (±0.5 pts = neutral; TOO CLOSE TO CALL when within simulation noise) when standings are available, else by lineup pts/week |
 | `odds.you/partner.before/after/delta` | Playoff, first-round bye, and title probabilities from 4,000 simulated seasons (real schedule and records) |
+| `odds.you.delta_se` | Standard error of each change (simulation noise); quote title changes as Δ ± 2·SE |
 | `title_leverage` | Title-odds value of one point in each week: shows whether regular season or playoff weeks matter more *for this user's standings* |
 | `you.delta_per_week`, `delta_regular`, `delta_playoffs` | Expected starting-lineup points (rest of season), measured after both teams' free waiver moves |
-| `you.waiver_moves` | Free pickups the user should make regardless; the trade gets no credit for them |
+| `you.waiver_moves` | Free pickups not involving the traded players; the trade gets no credit for them. Run `waiver-moves` for the unconstrained list |
 | `you.drops` / `you.adds` | Roster moves the trade forces (over the roster limit → cut; open spot → pickup) |
 | `market.tier` | LIKELY / PLAUSIBLE / UNLIKELY the partner accepts (FantasyCalc perceived value + their lineup change) |
 | `market.gap_pct` | > 0: user receives more market value; < 0: user overpays |

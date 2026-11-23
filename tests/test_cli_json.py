@@ -29,3 +29,19 @@ def test_json_mode_keeps_stdout_pure_when_libraries_print(monkeypatch, capfd):
     out, err = capfd.readouterr()
     assert json.loads(out) == {"moves": [], "score": 1.25}
     assert "2026 done." in err and "Downcasting floats." in err
+
+
+def test_json_mode_reports_any_exception_as_json(monkeypatch, capfd):
+    import pytest
+
+    class BrokenAdvisor:
+        def get_waiver_moves(self, **kwargs):
+            raise KeyError("settings")
+
+    monkeypatch.setattr(cli, "FantasyAdvisor", BrokenAdvisor)
+    monkeypatch.setattr(sys, "argv", ["fantasy-intel", "waiver-moves", "--json"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 1
+    out, _ = capfd.readouterr()
+    assert json.loads(out) == {"error": "KeyError: 'settings'"}

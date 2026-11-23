@@ -29,14 +29,17 @@ All constants live in `src/fantasy_intel/config.py`.
 ## Rest-of-season (ROS) lineup value
 
 - **Projections**: Sleeper weekly projections per remaining week (out of sample on 2026 wks
-  5-10: MAE 5.02 vs the model's 5.47; blending hurt). Byes from the schedule (nflverse team
-  codes mapped to Sleeper, e.g. LA → LAR).
+  5-10: MAE 5.02 vs the model's 5.47; blending hurt), scored stat by stat with the league's own
+  scoring settings (6-pt passing TDs, first-down bonuses, TE premium all count). Byes from the
+  schedule (nflverse team codes mapped to Sleeper, e.g. LA → LAR).
+- **Current week**: players whose game has already kicked off count 0 in projections; their
+  starters' live points (and the lineup slots they used) are banked from Sleeper matchups.
 - **Availability**: P(a regular plays next game) QB .915, RB .960, WR .911, TE .885 (measured);
   next week by tag: Questionable .80, Doubtful .25, Out/IR 0. IR/Out players Sleeper doesn't
   project count 0 until projected again.
 - **Simulation**: 300 availability scenarios, best lineup re-solved each week (dedicated slots,
-  then flex most-restrictive first), common random numbers so before/after differences are
-  the trade only.
+  then the best feasible flex assignment, exact for any mix of flex types), common random
+  numbers so before/after differences are the trade only.
 - **Roster limits**: over the limit → cut the least valuable player; open spot → best free
   agent; IR-tagged players to open IR slots.
 - **Waiver-optimized baseline**: before valuing a trade, both teams make their best free
@@ -47,7 +50,7 @@ All constants live in `src/fantasy_intel/config.py`.
 
 - Pool: top 10 unrostered players per position by ROS projection (Sleeper does not expose
   per-league waiver status).
-- Greedy swaps (drop one of the 6 lowest-ROS active players, add a free agent) while a swap
+- Greedy swaps (drop any active player, e.g. a redundant backup QB; add a free agent) while a swap
   gains ≥ 0.1 pts/week; up to `--max-moves` (default 3). Odds re-simulated after each step.
 - `alternatives`: best single swap for each remaining free agent from the final roster.
 - `has_trade_value`: suggested drop worth ≥ 500 on FantasyCalc.
@@ -59,7 +62,11 @@ All constants live in `src/fantasy_intel/config.py`.
   seeds when playoff teams isn't a power of two.
 - Team score ~ Normal(projected lineup mean, σ), σ = pooled within-team SD of this league's
   last 8 weeks. K/DEF excluded (assumed equal). Third-party teams use current rosters.
-- Verdict: title-odds change, ±0.5 percentage points = neutral.
+- Verdict: title-odds change, ±0.5 percentage points = neutral. "TOO CLOSE TO CALL" when the
+  change ± 2 standard errors (paired, from the same simulations) spans a verdict boundary.
+- During the playoffs (current week after the first playoff week) title odds are off: the
+  simulator would replay decided rounds. Verdicts fall back to lineup points.
+- Two-week rounds (`playoff_round_type` 1/2) are modeled; weeks past 18 are cut.
 - `title_leverage[w]`: title-odds change per projected point in week w.
 
 ## Market (FantasyCalc)

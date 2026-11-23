@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import argparse
+import logging
 import sys
 from rich.console import Console
 from rich.table import Table
@@ -1034,6 +1035,7 @@ def render_trade_eval(advisor: FantasyAdvisor, args):
         return ", ".join(f"{c['name']} ({c.get('position', '?')})" for c in cards)
 
     color = {"HURTS YOU": "red", "FAVORS YOU": "green"}.get(result["verdict"], "green" if "WIN-WIN" in result["verdict"] else "yellow")
+    # ± is 2 standard errors of simulation noise on the title-odds change
     console.print(Panel(
         f"[bold]You send:[/bold] {names(result['you_send'])}\n"
         f"[bold]You get:[/bold]  {names(result['you_get'])}   [dim](from {result['partner_name']})[/dim]\n\n"
@@ -1041,7 +1043,7 @@ def render_trade_eval(advisor: FantasyAdvisor, args):
         + (
             "".join(
                 f"{label}: title {o['before']['title']:.1%} → [bold]{o['after']['title']:.1%}[/bold] "
-                f"({o['delta']['title'] * 100:+.1f} pts) · playoffs {o['before']['playoffs']:.0%} → {o['after']['playoffs']:.0%} "
+                f"({o['delta']['title'] * 100:+.1f} ± {2 * (o.get('delta_se') or {}).get('title', 0.0) * 100:.1f} pts) · playoffs {o['before']['playoffs']:.0%} → {o['after']['playoffs']:.0%} "
                 f"· bye {o['before']['bye']:.0%} → {o['after']['bye']:.0%}\n"
                 for label, o in (("You", result["odds"]["you"]), (result["partner_name"], result["odds"]["partner"]))
             )
@@ -1084,7 +1086,10 @@ def render_trade_eval(advisor: FantasyAdvisor, args):
     if you.get("waiver_moves") or partner.get("waiver_moves"):
         lines = []
         if you.get("waiver_moves"):
-            lines.append("[bold]You (do these regardless of the trade):[/bold]")
+            lines.append(
+                "[bold]You (free moves not involving the players in this trade; "
+                "run `waiver-moves` for the unconstrained list):[/bold]"
+            )
             lines += [f"  • {move_text(m)}" for m in you["waiver_moves"]]
         if partner.get("waiver_moves"):
             lines.append(f"[dim]{result['partner_name']} (assumed in their baseline):[/dim]")
@@ -1283,7 +1288,12 @@ def main():
         import contextlib
 
         with contextlib.redirect_stdout(sys.stderr):
-            _dispatch(FantasyAdvisor(), args)
+            try:
+                _dispatch(FantasyAdvisor(), args)
+            except Exception as e:  # stdout must stay valid JSON on any failure
+                logging.getLogger(__name__).exception("command failed")
+                emit_json({"error": f"{type(e).__name__}: {e}"})
+                sys.exit(1)
         return
     _dispatch(FantasyAdvisor(), args)
 
