@@ -70,6 +70,9 @@ OUTPUT_COLUMNS = [
     "fantasy_points_ppr",
     "expected_fp_ppr",
     "fp_diff",
+    "proj_ppg",
+    "fpoe_eff",
+    "fpoe_excess_3w",
     "rationale",
 ]
 
@@ -85,12 +88,21 @@ def _has_rolling_signals(df: pd.DataFrame) -> bool:
     return "rolling_xfp_3w" in df.columns and "rolling_fpoe_3w" in df.columns
 
 
+def _has_baseline_signals(df: pd.DataFrame) -> bool:
+    return {"fpoe_excess_3w", "fpoe_eff_pre", "proj_ppg", "rolling_xfp_3w"}.issubset(df.columns)
+
+
 class TradeAnalyzer:
     """Identifies players whose fantasy output deviates sharply from true opportunity."""
 
-    def __init__(self, weekly_df: pd.DataFrame):
+    def __init__(
+        self,
+        weekly_df: pd.DataFrame,
+        scoring: str = SCORING_PPR,
+        fpoe_history: Optional[pd.DataFrame] = None,
+    ):
         traj = compute_player_trajectories(weekly_df)
-        self.df = estimate_expected_fantasy_points(traj)
+        self.df = estimate_expected_fantasy_points(traj, scoring=scoring, fpoe_history=fpoe_history)
 
     def _latest_frame(
         self,
@@ -134,12 +146,33 @@ class TradeAnalyzer:
         if filtered.empty:
             return pd.DataFrame()
 
-        if _has_rolling_signals(filtered):
+        if _has_baseline_signals(filtered):
+            # Judge recent FPOE against the player's own efficiency baseline:
+            # an efficient player merely scoring at his usual rate is not "unlucky"
+            buy_low = filtered[
+                (filtered["offense_pct"] >= min_snaps)
+                & (filtered["rolling_xfp_3w"] >= BUY_LOW_MIN_ROLLING_XFP)
+                & (filtered["fpoe_excess_3w"] <= BUY_LOW_MAX_ROLLING_FPOE)
+            ].copy()
+            if buy_low.empty:
+                return pd.DataFrame()
+            buy_low["rationale"] = buy_low.apply(
+                lambda r: (
+                    f"Rolling xFP {r['rolling_xfp_3w']:.1f}; scoring {r['fpoe_excess_3w']:+.1f}/gm vs his own "
+                    f"efficiency baseline ({r['fpoe_eff_pre']:+.0%}); projects {r['proj_ppg']:.1f} PPG "
+                    f"({int(r['offense_pct']*100)}% snaps, {int(r['touches'])} touches/targets)"
+                ),
+                axis=1,
+            )
+            sort_col = "fpoe_excess_3w"
+        elif _has_rolling_signals(filtered):
             buy_low = filtered[
                 (filtered["offense_pct"] >= min_snaps)
                 & (filtered["rolling_xfp_3w"] >= BUY_LOW_MIN_ROLLING_XFP)
                 & (filtered["rolling_fpoe_3w"] <= BUY_LOW_MAX_ROLLING_FPOE)
             ].copy()
+            if buy_low.empty:
+                return pd.DataFrame()
             buy_low["rationale"] = buy_low.apply(
                 lambda r: (
                     f"Rolling 3-week xFP {r['rolling_xfp_3w']:.1f} masked by "
@@ -155,6 +188,8 @@ class TradeAnalyzer:
                 & (filtered["expected_fp_ppr"] >= 10.0)
                 & (filtered["fp_diff"] <= -3.0)
             ].copy()
+            if buy_low.empty:
+                return pd.DataFrame()
             buy_low["rationale"] = buy_low.apply(
                 lambda r: f"Underperformed xFP by {abs(r['fp_diff']):.1f} pts despite {int(r['offense_pct']*100)}% snap share and {int(r['touches'])} touches/targets",
                 axis=1,
@@ -184,11 +219,29 @@ class TradeAnalyzer:
         else:
             filtered["recent_ppg"] = pd.to_numeric(filtered["fantasy_points_ppr"], errors="coerce").fillna(0.0)
 
-        if _has_rolling_signals(filtered):
+        if _has_baseline_signals(filtered):
+            sell_high = filtered[
+                (filtered["recent_ppg"] >= SELL_HIGH_MIN_RECENT_PPG)
+                & (filtered["fpoe_excess_3w"] >= SELL_HIGH_MIN_ROLLING_FPOE)
+            ].copy()
+            if sell_high.empty:
+                return pd.DataFrame()
+            sell_high["rationale"] = sell_high.apply(
+                lambda r: (
+                    f"Recent {r['recent_ppg']:.1f} PPG is {r['fpoe_excess_3w']:+.1f}/gm above his own "
+                    f"efficiency baseline ({r['fpoe_eff_pre']:+.0%} on {r['rolling_xfp_3w']:.1f} xFP); "
+                    f"projects {r['proj_ppg']:.1f} PPG"
+                ),
+                axis=1,
+            )
+            sort_col = "fpoe_excess_3w"
+        elif _has_rolling_signals(filtered):
             sell_high = filtered[
                 (filtered["recent_ppg"] >= SELL_HIGH_MIN_RECENT_PPG)
                 & (filtered["rolling_fpoe_3w"] >= SELL_HIGH_MIN_ROLLING_FPOE)
             ].copy()
+            if sell_high.empty:
+                return pd.DataFrame()
             sell_high["rationale"] = sell_high.apply(
                 lambda r: (
                     f"Recent {r['recent_ppg']:.1f} PPG vs rolling xFP {r['rolling_xfp_3w']:.1f} "
@@ -202,6 +255,8 @@ class TradeAnalyzer:
                 (filtered["fantasy_points_ppr"] >= 15.0)
                 & (filtered["fp_diff"] >= 5.0)
             ].copy()
+            if sell_high.empty:
+                return pd.DataFrame()
             sell_high["rationale"] = sell_high.apply(
                 lambda r: f"Outperformed true usage by +{r['fp_diff']:.1f} pts on limited volume ({int(r['touches'])} touches, {int(r['offense_pct']*100)}% snaps)",
                 axis=1,
@@ -247,7 +302,8 @@ def replacement_rank(pos: str, league_context: Dict[str, Any]) -> int:
 def compute_replacement_levels(pool: pd.DataFrame, league_context: Dict[str, Any]) -> Dict[str, Any]:
     """Dynamic replacement baselines at each tradeable position for a league-relevant pool.
 
-    replacement_xfp[pos] is the rolling_xfp_3w of the K_pos-th ranked player at
+    replacement_xfp[pos] is the projection (proj_ppg: skill-adjusted rolling xFP,
+    else rolling_xfp_3w) of the K_pos-th ranked player at
     that position and replacement_market[pos] is the same rank on market_ppg
     (0.7 * recent actual PPG + 0.3 * rolling xFP). Falls back to the worst
     available player when the pool is smaller than K_pos.
@@ -277,7 +333,8 @@ def compute_replacement_levels(pool: pd.DataFrame, league_context: Dict[str, Any
     for pos in TRADEABLE_POSITIONS:
         k = replacement_rank(pos, league_context)
         result["k_pos"][pos] = k
-        if empty or "position" not in pool.columns or "rolling_xfp_3w" not in pool.columns:
+        value_col = "proj_ppg" if (not empty and "proj_ppg" in pool.columns) else "rolling_xfp_3w"
+        if empty or "position" not in pool.columns or value_col not in pool.columns:
             result["replacement_xfp"][pos] = 0.0
             result["replacement_market"][pos] = 0.0
             continue
@@ -286,7 +343,7 @@ def compute_replacement_levels(pool: pd.DataFrame, league_context: Dict[str, Any
             result["replacement_xfp"][pos] = 0.0
             result["replacement_market"][pos] = 0.0
             continue
-        xfp_ranked = pd.to_numeric(sub["rolling_xfp_3w"], errors="coerce").fillna(0.0).sort_values(ascending=False).tolist()
+        xfp_ranked = pd.to_numeric(sub[value_col], errors="coerce").fillna(0.0).sort_values(ascending=False).tolist()
         market_ranked = pd.to_numeric(sub["market_ppg"], errors="coerce").fillna(0.0).sort_values(ascending=False).tolist()
         idx = min(k, len(xfp_ranked)) - 1
         result["replacement_xfp"][pos] = float(xfp_ranked[idx])
@@ -371,6 +428,18 @@ def _prepare_trade_frame(metrics_df: pd.DataFrame, league_context: Dict[str, Any
         frame[col] = pd.to_numeric(frame[col], errors="coerce").fillna(0.0)
     if "position" in frame.columns:
         frame["position"] = frame["position"].astype(str).str.upper()
+
+    # Model value: skill-adjusted projection (xFP x player's shrunk efficiency)
+    # when the FPOE baseline is available, else raw rolling xFP. Regression
+    # signal: FPOE beyond the player's own baseline, else raw rolling FPOE.
+    if "proj_ppg" in frame.columns:
+        frame["proj_ppg"] = pd.to_numeric(frame["proj_ppg"], errors="coerce").fillna(frame["rolling_xfp_3w"])
+    else:
+        frame["proj_ppg"] = frame["rolling_xfp_3w"]
+    if "fpoe_excess_3w" in frame.columns:
+        frame["fpoe_signal"] = pd.to_numeric(frame["fpoe_excess_3w"], errors="coerce").fillna(frame["rolling_fpoe_3w"])
+    else:
+        frame["fpoe_signal"] = frame["rolling_fpoe_3w"]
 
     # Public-perception proxy blend: 70% recent actual PPG + 30% rolling xFP
     frame["market_ppg"] = (0.7 * frame["recent_ppr"] + 0.3 * frame["rolling_xfp_3w"]).round(2)
@@ -489,10 +558,12 @@ def generate_league_trade_proposals(
             "rolling_xfp_3w": _num("rolling_xfp_3w"),
             "recent_ppg": _num("recent_ppr"),
             "rolling_fpoe_3w": _num("rolling_fpoe_3w"),
+            "proj_ppg": _num("proj_ppg") if row is not None and "proj_ppg" in row.index else _num("rolling_xfp_3w"),
+            "fpoe_signal": _num("fpoe_signal") if row is not None and "fpoe_signal" in row.index else _num("rolling_fpoe_3w"),
         }
         rec["market_ppg"] = round(0.7 * rec["recent_ppg"] + 0.3 * rec["rolling_xfp_3w"], 2)
         if position in TRADEABLE_POSITIONS:
-            rec["model_vorp"] = max(0.0, rec["rolling_xfp_3w"] - repl["replacement_xfp"][position])
+            rec["model_vorp"] = max(0.0, rec["proj_ppg"] - repl["replacement_xfp"][position])
             rec["market_vorp"] = max(0.0, rec["market_ppg"] - repl["replacement_market"][position])
         else:
             rec["model_vorp"] = 0.0
@@ -517,7 +588,7 @@ def generate_league_trade_proposals(
                     "player_id": records[pid]["player_id"],
                     "name": records[pid]["name"],
                     "position": records[pid]["position"],
-                    "value": records[pid]["rolling_xfp_3w"],
+                    "value": records[pid]["proj_ppg"],
                     "injury_status": records[pid]["injury_status"],
                 }
                 for pid in pid_set
@@ -567,9 +638,9 @@ def generate_league_trade_proposals(
 
     def player_card(rec: Dict[str, Any]) -> Dict[str, Any]:
         tag = None
-        if rec["rolling_xfp_3w"] >= BUY_LOW_MIN_ROLLING_XFP and rec["rolling_fpoe_3w"] <= BUY_LOW_MAX_ROLLING_FPOE:
+        if rec["rolling_xfp_3w"] >= BUY_LOW_MIN_ROLLING_XFP and rec["fpoe_signal"] <= BUY_LOW_MAX_ROLLING_FPOE:
             tag = "buy-low"
-        elif rec["recent_ppg"] >= SELL_HIGH_MIN_RECENT_PPG and rec["rolling_fpoe_3w"] >= SELL_HIGH_MIN_ROLLING_FPOE:
+        elif rec["recent_ppg"] >= SELL_HIGH_MIN_RECENT_PPG and rec["fpoe_signal"] >= SELL_HIGH_MIN_ROLLING_FPOE:
             tag = "sell-high"
         return {
             "player_id": rec["player_id"],
@@ -579,6 +650,8 @@ def generate_league_trade_proposals(
             "rolling_xfp_3w": rec["rolling_xfp_3w"],
             "recent_ppg": rec["recent_ppg"],
             "rolling_fpoe_3w": rec["rolling_fpoe_3w"],
+            "proj_ppg": round(rec["proj_ppg"], 2),
+            "fpoe_signal": round(rec["fpoe_signal"], 2),
             "market_ppg": rec["market_ppg"],
             "model_vorp": round(rec["model_vorp"], 2),
             "market_vorp": round(rec["market_vorp"], 2),
@@ -602,12 +675,12 @@ def generate_league_trade_proposals(
         for c in send_cards:
             if c["tag"] == "sell-high":
                 parts.append(
-                    f"sell-high: {c['name']} FPOE {c['rolling_fpoe_3w']:+.1f} vs rolling xFP {c['rolling_xfp_3w']:.1f}"
+                    f"sell-high: {c['name']} running {c['fpoe_signal']:+.1f}/gm above his efficiency baseline"
                 )
         for c in receive_cards:
             if c["tag"] == "buy-low":
                 parts.append(
-                    f"buy-low: {c['name']} rolling xFP {c['rolling_xfp_3w']:.1f} masked by {c['rolling_fpoe_3w']:+.1f} FPOE"
+                    f"buy-low: {c['name']} rolling xFP {c['rolling_xfp_3w']:.1f}, running {c['fpoe_signal']:+.1f}/gm vs his baseline"
                 )
         if need_hit:
             parts.append("fills their " + "/".join(sorted(need_hit)) + " hole")
@@ -622,7 +695,7 @@ def generate_league_trade_proposals(
                 decay_note += f"; you cut {user_drop_name}"
             parts.append(decay_note)
         if not parts:
-            parts.append(f"upgrades your optimal lineup by +{d_user:.1f} rolling xFP")
+            parts.append(f"upgrades your optimal lineup by +{d_user:.1f} projected PPG")
         return "; ".join(parts)
 
     proposals: List[Dict[str, Any]] = []

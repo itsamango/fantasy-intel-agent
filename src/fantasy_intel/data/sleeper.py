@@ -10,11 +10,31 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 import requests
 
-from fantasy_intel.config import CACHE_DIR, SCORING_HALF_PPR, SCORING_PPR, SCORING_STANDARD, SCORING_TEP
+from fantasy_intel.config import CACHE_DIR, DEFAULT_SEASON, SCORING_HALF_PPR, SCORING_PPR, SCORING_STANDARD, SCORING_TEP
 
 logger = logging.getLogger(__name__)
 
 SLEEPER_BASE_URL = "https://api.sleeper.app/v1"
+# Undocumented web endpoint that returns per-week stats with team-at-game-time,
+# opponent, and game_id (the v1 stats dict carries none of these).
+SLEEPER_WEB_STATS_URL = "https://api.sleeper.com/stats/nfl"
+
+# Live-data cache TTLs (hours). Season stats and projections change daily
+# in-season; completed-week stats only change for official stat corrections.
+SEASON_STATS_TTL_HOURS = 6.0
+PROJECTIONS_TTL_HOURS = 6.0
+RECENT_WEEK_STATS_TTL_HOURS = 6.0
+
+WEEKLY_STAT_POSITIONS = ("QB", "RB", "WR", "TE")
+
+
+def _cache_fresh(path: Path, ttl_hours: Optional[float]) -> bool:
+    """True when the cache file exists and is younger than ttl_hours (None = never expires)."""
+    if not path.exists():
+        return False
+    if ttl_hours is None:
+        return True
+    return (time.time() - path.stat().st_mtime) / 3600 < ttl_hours
 
 
 def _percentile(sorted_vals: List[float], p: float) -> float:
@@ -82,9 +102,9 @@ class SleeperClient:
             return []
 
     def get_season_stats(self, season: int = 2026, force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
-        """Fetches and caches cumulative in-season player stats from Sleeper."""
+        """Fetches and caches cumulative in-season player stats from Sleeper (6h TTL)."""
         cache_path = self.cache_dir / f"sleeper_stats_{season}.json"
-        if cache_path.exists() and not force_refresh:
+        if _cache_fresh(cache_path, SEASON_STATS_TTL_HOURS) and not force_refresh:
             try:
                 with open(cache_path, "r", encoding="utf-8") as f:
                     return json.load(f)
@@ -106,9 +126,9 @@ class SleeperClient:
     def get_week_projections(
         self, season: int = 2026, week: int = 1, force_refresh: bool = False
     ) -> Dict[str, Dict[str, Any]]:
-        """Fetches and caches weekly player projections from Sleeper."""
+        """Fetches and caches weekly player projections from Sleeper (6h TTL)."""
         cache_path = self.cache_dir / f"sleeper_projections_{season}_{week}.json"
-        if cache_path.exists() and not force_refresh:
+        if _cache_fresh(cache_path, PROJECTIONS_TTL_HOURS) and not force_refresh:
             try:
                 with open(cache_path, "r", encoding="utf-8") as f:
                     return json.load(f)
@@ -126,6 +146,74 @@ class SleeperClient:
         except Exception as e:
             logger.error(f"Failed to fetch sleeper projections for {season} W{week}: {e}")
             return {}
+
+    def get_week_stats(
+        self,
+        season: int,
+        week: int,
+        ttl_hours: Optional[float] = None,
+        force_refresh: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Per-week player stat lines for QB/RB/WR/TE, normalized to a list of records.
+
+        Each record: {"player_id", "team", "opponent", "game_id", "position",
+        "stats"}. Primary source is Sleeper's web stats endpoint, which carries
+        team-at-game-time (needed for correct team target shares after mid-season
+        trades). Falls back to the v1 stats dict, whose records have team /
+        opponent / game_id = None and position = None (callers fill them from the
+        players DB). ttl_hours=None caches forever (settled past weeks).
+        """
+        cache_path = self.cache_dir / f"sleeper_week_stats_{season}_{week}.json"
+        if not force_refresh and _cache_fresh(cache_path, ttl_hours):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to read cached week stats for {season} W{week}: {e}")
+
+        records: List[Dict[str, Any]] = []
+        try:
+            params = [("season_type", "regular")] + [("position[]", p) for p in WEEKLY_STAT_POSITIONS]
+            resp = requests.get(f"{SLEEPER_WEB_STATS_URL}/{season}/{week}", params=params, timeout=30)
+            resp.raise_for_status()
+            for entry in resp.json() or []:
+                stats = entry.get("stats") or {}
+                pid = entry.get("player_id")
+                if not pid or not stats:
+                    continue
+                player = entry.get("player") or {}
+                records.append({
+                    "player_id": str(pid),
+                    "team": entry.get("team") or player.get("team"),
+                    "opponent": entry.get("opponent"),
+                    "game_id": entry.get("game_id"),
+                    "position": player.get("position"),
+                    "stats": stats,
+                })
+        except Exception as e:
+            logger.warning(f"Sleeper web stats unavailable for {season} W{week} ({e}); using v1 stats endpoint.")
+            try:
+                resp = requests.get(f"{SLEEPER_BASE_URL}/stats/nfl/regular/{season}/{week}", timeout=30)
+                resp.raise_for_status()
+                for pid, stats in (resp.json() or {}).items():
+                    if str(pid).startswith("TEAM_") or not stats:
+                        continue
+                    records.append({
+                        "player_id": str(pid),
+                        "team": None,
+                        "opponent": None,
+                        "game_id": None,
+                        "position": None,
+                        "stats": stats,
+                    })
+            except Exception as e2:
+                logger.error(f"Failed to fetch Sleeper week stats for {season} W{week}: {e2}")
+                return []
+
+        if records:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(records, f)
+        return records
 
     def get_bye_teams(self, season: int = 2026, week: int = 1) -> Set[str]:
         """Identifies NFL teams on bye for the given week based on zero player projections."""
@@ -216,7 +304,7 @@ class SleeperClient:
             return resp.json()
         except Exception as e:
             logger.error(f"Error fetching NFL state: {e}")
-            return {"season": "2024", "week": 1}
+            return {"season": str(DEFAULT_SEASON), "week": 1}
 
     def get_user(self, username: str) -> Optional[Dict[str, Any]]:
         """Fetch user profile by Sleeper username or user_id."""
